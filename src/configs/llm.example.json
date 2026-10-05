@@ -1,0 +1,8 @@
+{
+  "model": {
+    "provider": "minimax",
+    "model": "MiniMax-M3",
+    "base_url": "https://api.minimax.cn/v1",
+    "api_key": ""
+  }
+}

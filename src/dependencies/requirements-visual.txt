@@ -1,0 +1,4 @@
+# Additional packages for the visual experiment, after the base RAP runtime.
+# The adjacent dual-rag source and local surrogate weights are also required.
+open_clip_torch==3.3.0
+pytest>=8,<10

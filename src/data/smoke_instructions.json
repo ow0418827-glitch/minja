@@ -1,0 +1,14 @@
+[
+  {
+    "session": "fixed_0_0",
+    "instruction": "i want a blue toothbrush for sensitive teeth, and price lower than 40.00 dollars"
+  },
+  {
+    "session": "fixed_0_1",
+    "instruction": "i need a blue toothbrush for sensitive teeth, and price lower than 40.00 dollars"
+  },
+  {
+    "session": "fixed_0_2",
+    "instruction": "i want the DenTek Professional Oral Care Kit with DenTek Triple Clean Advanced Clean Floss Picks, and price lower than 20.00 dollars"
+  }
+]

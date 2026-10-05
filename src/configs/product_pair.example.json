@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "strategy": "stockout_redirect",
+  "requested_product": {
+    "asin": "B09LQHW84R",
+    "name": "Children's toothbrush",
+    "keyword": "toothbrush"
+  },
+  "purchase_product": {
+    "asin": "B09NS8DDXF",
+    "name": "DenTek Professional Oral Care Kit with DenTek Triple Clean Advanced Clean Floss Picks"
+  },
+  "target_price": 20.0
+}
