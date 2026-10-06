@@ -11,7 +11,8 @@ import shutil
 import numpy as np
 from PIL import Image
 
-from src.vision.dual_rag_bridge import DEFAULT_DUAL_ROOT, generate_attack, make_encoder
+from src.vision.dual_rag_bridge import DEFAULT_DUAL_ROOT, make_encoder
+from src.vision.frequency_attack import generate_attack, frequency_settings
 from src.vision.visual_retrieval import VisualMemoryRetriever, dump_json, resolve_image, sha256
 from src.memory.memory_pairing import load_pairing, validate_paired_memory
 
@@ -147,6 +148,14 @@ def paired_ranking(clean, poisoned, output, query_image, instruction, encoder, m
 
 
 def prepare(args):
+    frequency_options = {}
+    if getattr(args, 'method', 'legacy_pixel') == 'frequency_momentum':
+        frequency_options = {'frequency_axis_ratio': getattr(args, 'frequency_axis_ratio', None),
+                             'frequency_momentum': getattr(args, 'frequency_momentum', None)}
+        frequency_settings(args.optimization_config, root=args.dual_rag_root, **frequency_options)
+    elif (getattr(args, 'frequency_axis_ratio', None) is not None
+            or getattr(args, 'frequency_momentum', None) is not None):
+        raise ValueError('Frequency parameters require --method frequency_momentum')
     pairing = configure_visual_args(args)
     output = Path(args.output).resolve()
     if output.exists() and any(output.iterdir()):
@@ -185,7 +194,7 @@ def prepare(args):
         adversarial, attack_metadata = generate_attack(
             source, target, output / 'attack', root=args.dual_rag_root,
             optimization_config=args.optimization_config, method=args.method, steps=args.steps,
-            epsilon_levels=args.epsilon_levels, device=args.device)
+            epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options)
     clean, poisoned, audit = build_banks(memory_path, args.memory_id, source, adversarial,
                                         output, args.source_asin, args.epsilon_levels, pairing=pairing)
     encoder = encoder_from_args(args)
@@ -207,6 +216,9 @@ def prepare(args):
         'top_k': args.top_k, 'pixel_audit': audit, 'similarity': similarity,
         'attack': attack_metadata, 'text_history_frozen': True,
     }
+    if getattr(args, 'method', 'legacy_pixel') == 'frequency_momentum' and not args.adversarial_image:
+        manifest['frequency_settings'] = frequency_settings(args.optimization_config,
+            root=args.dual_rag_root, **frequency_options)
     dump_json(output / 'manifest.json', manifest)
     print(json.dumps({'output': str(output), 'similarity': similarity,
                       'new_source_recall': ranking['new_source_recall']}, ensure_ascii=False, indent=2))
@@ -366,7 +378,11 @@ def main():
         prepare_parser.add_argument('--' + name, required=True)
     for name in ('source-asin', 'target-asin', 'source-image', 'query-image', 'adversarial-image'):
         prepare_parser.add_argument('--' + name)
-    prepare_parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency'], default='legacy_pixel')
+    prepare_parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum'], default='legacy_pixel')
+    prepare_parser.add_argument('--frequency-axis-ratio', type=float,
+        help='frequency_momentum only: per-axis DCT bandwidth ratio in (0, 1]; defaults to optimization config')
+    prepare_parser.add_argument('--frequency-momentum', type=float,
+        help='frequency_momentum only: gradient momentum in [0, 1]; defaults to 1.0')
     prepare_parser.add_argument('--steps', type=int, default=1000)
     prepare_parser.add_argument('--epsilon-levels', type=int, default=16)
     prepare_parser.add_argument('--top-k', type=int, default=1)

@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from urllib.parse import unquote, urljoin, urlparse
 
 from PIL import Image, UnidentifiedImageError
@@ -23,6 +24,39 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 50_000_000
 IMAGE_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}
 IMAGE_MIMES = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}
+
+
+class RecoverableImageDownloadError(requests.ConnectionError):
+    """A bounded transient image request failed; no image or memory was accepted."""
+    recoverable = True
+
+    def __init__(self, reason, attempts):
+        super().__init__(f'Image download failed after {attempts} attempts ({reason})')
+        self.download_reason = reason
+        self.download_attempts = attempts
+
+
+def transient_image_error_reason(error):
+    """Classify transport failures without hiding certificates or invalid data."""
+    if isinstance(error, requests.exceptions.SSLError):
+        message = str(error).lower()
+        if any(marker in message for marker in ('certificate', 'hostname mismatch')):
+            return None
+        if any(marker in message for marker in ('unexpected_eof', 'eof occurred',
+                'ssleoferror', 'connection reset', 'connection aborted')):
+            return 'image_secure_connection_interrupted'
+        return None
+    if isinstance(error, requests.Timeout):
+        return 'image_request_timeout'
+    if isinstance(error, requests.exceptions.ChunkedEncodingError):
+        return 'image_response_stream_interrupted'
+    if isinstance(error, requests.ConnectionError):
+        return 'image_connection_interrupted'
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else None
+        if status in (408, 429, 500, 502, 503, 504):
+            return f'image_http_status_{status}'
+    return None
 
 
 def validated_image_bytes(record, memory_path=None, *, require_digest=True):
@@ -324,9 +358,13 @@ def _download_image_body(source_url, *, timeout, max_attempts):
                         raise ValueError('Image exceeds maximum download size')
                     chunks.append(chunk)
                 return b''.join(chunks)
-        except (requests.RequestException, OSError):
-            if attempt + 1 == max_attempts:
+        except requests.RequestException as exc:
+            reason = transient_image_error_reason(exc)
+            if reason is None:
                 raise
+            if attempt + 1 == max_attempts:
+                raise RecoverableImageDownloadError(reason, max_attempts) from exc
+            time.sleep(min(0.5 * (2 ** attempt), 2.0))
 
 
 def extract_page_images(html_obj, page_type, asin="", page_url=""):

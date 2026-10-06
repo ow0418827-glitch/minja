@@ -10,9 +10,12 @@ param(
     [string]$IndicationPrompt = (Join-Path $PSScriptRoot 'src\data\indication_prompt_template_neutral.json'),
     [ValidateRange(1,100)][int]$IndicationLevel = 1,
     [ValidateRange(1,100000)][int]$AttackSteps = 1000,
-    [ValidateSet('legacy_pixel','fair_pixel','frequency')][string]$Method = 'legacy_pixel',
+    [ValidateSet('legacy_pixel','fair_pixel','frequency','frequency_momentum')][string]$Method = 'legacy_pixel',
+    [Nullable[double]]$FrequencyAxisRatio = $null,
+    [Nullable[double]]$FrequencyMomentum = $null,
     [ValidateRange(1,255)][int]$EpsilonLevels = 16,
     [string]$OptimizationConfig,
+    [string]$ReferenceOverrides,
     [ValidateRange(1,200)][int]$NumSteps = 20,
     [ValidateRange(1,20)][int]$NormalRetries = 2,
     [ValidateRange(1,50)][int]$HistoryMaxAttempts = 3,
@@ -41,11 +44,15 @@ param(
     [switch]$ModelCheck,
     [switch]$RetryErrors,
     [switch]$AllowCodeUpdateResume,
+    [switch]$AllowBoundHistoryRepairResume,
     [switch]$ReuseFrozenMemory,
     [switch]$DirectImages,
     [string]$Python = 'D:\Anaconda\envs\minja-vision\python.exe'
 )
 $ErrorActionPreference = 'Stop'
+if ($Method -ne 'frequency_momentum' -and ($null -ne $FrequencyAxisRatio -or $null -ne $FrequencyMomentum)) {
+    throw 'FrequencyAxisRatio and FrequencyMomentum require Method frequency_momentum.'
+}
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Python not found: $Python" }
 $env:PYTHONUTF8 = '1'
 $env:HF_HUB_OFFLINE = '1'
@@ -82,6 +89,9 @@ try {
             '--device',$Device,'--port',"$Port")
         foreach ($item in $Group) { $experimentArgs += @('--group', $item) }
         if ($OptimizationConfig) { $experimentArgs += @('--optimization-config', $OptimizationConfig) }
+        if ($ReferenceOverrides) { $experimentArgs += @('--reference-overrides', $ReferenceOverrides) }
+        if ($null -ne $FrequencyAxisRatio) { $experimentArgs += @('--frequency-axis-ratio', "$FrequencyAxisRatio") }
+        if ($null -ne $FrequencyMomentum) { $experimentArgs += @('--frequency-momentum', "$FrequencyMomentum") }
         if ($IncludeControls) { $experimentArgs += '--include-controls' }
         if ($NoPolicyQueryImage -or -not $PolicyQueryImage) {
             $experimentArgs += '--no-policy-query-image'
@@ -91,6 +101,7 @@ try {
         if ($ModelCheck) { $experimentArgs += '--model-check' }
         if ($RetryErrors) { $experimentArgs += '--retry-errors' }
         if ($AllowCodeUpdateResume) { $experimentArgs += '--allow-code-update-resume' }
+        if ($AllowBoundHistoryRepairResume) { $experimentArgs += '--allow-bound-history-repair-resume' }
         if ($ReuseFrozenMemory) { $experimentArgs += '--reuse-frozen-memory' }
         if ($DirectImages) { $experimentArgs += '--direct-images' }
         & $Python @experimentArgs

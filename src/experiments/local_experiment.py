@@ -88,6 +88,13 @@ def context(args):
                 'execution_version': EXECUTION_VERSION, 'memory_mode': getattr(args, 'memory_mode', 'full')}
     if getattr(args, 'text_baseline_only', False):
         settings['text_baseline_only'] = True
+    method = getattr(args, 'method', 'legacy_pixel')
+    if method != 'legacy_pixel':
+        settings['attack_method'] = method
+    if method == 'frequency_momentum':
+        from src.vision.frequency_attack import frequency_settings
+        settings.update(frequency_settings(frequency_axis_ratio=getattr(args, 'frequency_axis_ratio', None),
+            frequency_momentum=getattr(args, 'frequency_momentum', None)))
     if getattr(args, 'stage', None) == 'evaluate':
         source_name = args.source_run
         if not source_name or Path(source_name).name != source_name or source_name in ('.', '..'):
@@ -102,6 +109,13 @@ def context(args):
         manifest = read(source / 'visual/manifest.json')
         if manifest['attack']['attack']['steps_completed'] != args.attack_steps:
             raise ValueError('Requested attack steps do not match the frozen source attack')
+        source_method = source_settings.get('attack_method', 'legacy_pixel')
+        if method != source_method:
+            raise ValueError('Requested attack method does not match the frozen source attack')
+        if method == 'frequency_momentum':
+            for key in ('frequency_axis_ratio', 'frequency_momentum', 'frequency_implementation_sha256'):
+                if source_settings.get(key) != settings[key]:
+                    raise ValueError('Requested frequency settings do not match the frozen source attack')
         args.experiment = str(source / 'visual')
         settings.update(source_run=source_name, source_manifest_sha256=fingerprint(manifest),
                         normal_memory_count=read(source / 'memory_ready.json')['normal_count'],
@@ -329,6 +343,14 @@ def run_all(args):
     shared = ['--root', str(root), '--run-name', args.run_name, '--llm-config', str(Path(args.llm_config).resolve()),
               '--num-steps', str(args.num_steps), '--attack-steps', str(args.attack_steps),
               '--memory-mode', args.memory_mode, '--trials', str(args.trials)]
+    attack_options = []
+    if getattr(args, 'method', 'legacy_pixel') != 'legacy_pixel':
+        attack_options += ['--method', args.method]
+    if getattr(args, 'frequency_axis_ratio', None) is not None:
+        attack_options += ['--frequency-axis-ratio', str(args.frequency_axis_ratio)]
+    if getattr(args, 'frequency_momentum', None) is not None:
+        attack_options += ['--frequency-momentum', str(args.frequency_momentum)]
+    shared += attack_options
     shared += ['--text-top-k', str(text_top_k(args))]
     if getattr(args, 'include_text_baseline', False):
         shared.append('--include-text-baseline')
@@ -339,7 +361,7 @@ def run_all(args):
             '--memory', str(run / 'memory.json'), '--memory-id', ready['memory_id'],
             '--pairing-config', str(root / 'pairing.json'), '--target-image', str(root / tasks['query_image']),
             '--instruction', tasks['trials'][0]['instruction'], '--steps', str(args.attack_steps),
-            '--device', 'cuda', '--output', str(run / 'visual')], cwd=PROJECT, check=True)
+            '--device', 'cuda', '--output', str(run / 'visual')] + attack_options, cwd=PROJECT, check=True)
     subprocess.run(base + ['batch'] + shared, cwd=PROJECT, check=True)
 
 
@@ -351,6 +373,11 @@ def main():
     parser.add_argument('--llm-config', default=str(DEFAULT_CONFIG))
     parser.add_argument('--num-steps', type=int, default=20)
     parser.add_argument('--attack-steps', type=int, default=1000)
+    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum'], default='legacy_pixel')
+    parser.add_argument('--frequency-axis-ratio', type=float,
+        help='frequency_momentum only: per-axis DCT bandwidth ratio in (0, 1]; defaults to optimization config')
+    parser.add_argument('--frequency-momentum', type=float,
+        help='frequency_momentum only: gradient momentum in [0, 1]; defaults to 1.0')
     parser.add_argument('--source-run', default='m3_1000steps_trial01')
     parser.add_argument('--trials', type=int, choices=range(1, 21), default=20)
     parser.add_argument('--memory-mode', choices=['full', 'fragment'], default='full')
@@ -358,6 +385,12 @@ def main():
     parser.add_argument('--text-baseline-only', action='store_true')
     parser.add_argument('--text-top-k', type=int, default=3)
     args = parser.parse_args()
+    if args.method != 'frequency_momentum' and (args.frequency_axis_ratio is not None or args.frequency_momentum is not None):
+        parser.error('Frequency parameters require --method frequency_momentum')
+    if args.method == 'frequency_momentum':
+        from src.vision.frequency_attack import frequency_settings
+        frequency_settings(frequency_axis_ratio=args.frequency_axis_ratio,
+                           frequency_momentum=args.frequency_momentum)
     if args.num_steps < 1 or args.attack_steps < 1 or args.text_top_k < 1:
         parser.error('steps must be positive')
     {'run': run_all, 'train': train, 'batch': batch, 'evaluate': batch}[args.stage](args)

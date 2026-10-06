@@ -26,6 +26,7 @@ DEFAULT_SEED = 20261003
 PROTOCOL = 'victim_history_image_substitution'
 ATTACKER_PROTOCOL = 'attacker_owned_product_image_substitution'
 REFERENCE_SELECTION_POLICY = 'victim_keyword_in_catalog_title'
+OVERRIDE_SELECTION_POLICY = 'reviewed_catalog_product_image'
 
 
 def protocol_for_source_history(mode):
@@ -131,8 +132,8 @@ def _task(group_id, kind, ordinal, index, goal, provenance='human_goal'):
             'instruction_fingerprint': fingerprint(canonical_instruction(goal['instruction_text']))}
 
 
-def catalog_product_goal(product, price):
-    """A truthful legal demand when the fixed A has no human-authored goal.
+def catalog_product_goal(product, price, selected_options=None):
+    """A truthful legal demand using only real catalog attributes and options.
 
     No product, price, image, or reward is modified. The selected attribute and
     option values are already present in the catalog. This complete goal is
@@ -151,6 +152,14 @@ def catalog_product_goal(product, price):
     for key, values in sorted((product.get('options') or {}).items()):
         if values:
             options[str(key)] = str(values[0])
+    if selected_options is not None:
+        if not isinstance(selected_options, dict):
+            raise ValueError('Selected goal_options must be a mapping of real catalog option values')
+        catalog_options = product.get('options') or {}
+        for key, value in selected_options.items():
+            if key not in catalog_options or value not in catalog_options[key]:
+                raise ValueError(f'Selected goal option is absent from the real catalog: {key}={value}')
+            options[str(key)] = str(value)
     limit = round(float(price) + max(5.0, float(price) * 0.2), 2)
     if limit <= float(price):
         raise ValueError('Cannot create a feasible real-product price limit')
@@ -301,6 +310,164 @@ def _verify_image(path, digest):
         return False
 
 
+def _load_reference_overrides(path, source_history_mode):
+    """Freeze a reviewed local image configuration before any bundle writes."""
+    if path is None:
+        return {}, None
+    if source_history_mode != 'attacker':
+        raise ValueError('Reference overrides require source_history_mode=attacker')
+    config_path = Path(path).resolve()
+    payload = read(config_path)
+    entries = payload.get('groups') if isinstance(payload, dict) else None
+    if not isinstance(entries, dict) or not entries:
+        raise ValueError('Reference overrides need a non-empty groups mapping')
+    overrides = {}
+    for key, entry in entries.items():
+        if not str(key).isdigit() or not 1 <= int(key) <= 9 or int(key) in overrides:
+            raise ValueError(f'Invalid or duplicate reference override group: {key}')
+        if not isinstance(entry, dict):
+            raise ValueError(f'Reference override group {key} must be an object')
+        asin = str(entry.get('asin') or '').strip()
+        image_name = entry.get('image_path')
+        digest = str(entry.get('sha256') or '').lower()
+        if not asin or not isinstance(image_name, str) or not image_name:
+            raise ValueError(f'Reference override group {key} needs asin and image_path')
+        if not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise ValueError(f'Reference override group {key} needs an image sha256')
+        image_path = Path(image_name)
+        if not image_path.is_absolute():
+            image_path = config_path.parent / image_path
+        image_path = image_path.resolve()
+        if not _verify_image(image_path, digest):
+            raise ValueError(f'Reference override image sha256 mismatch or invalid image: group {key}')
+        if not entry.get('image_url') and 'catalog_image_index' not in entry:
+            raise ValueError(f'Reference override group {key} needs image_url or catalog_image_index')
+        overrides[int(key)] = dict(entry, asin=asin, image_path=str(image_path), sha256=digest)
+    frozen = {'config_path': str(config_path), 'content': payload,
+              'content_sha256': fingerprint(payload),
+              'image_sha256': {str(number): entry['sha256'] for number, entry in sorted(overrides.items())}}
+    return overrides, frozen
+
+
+def _catalog_image_urls(product):
+    """Include option images without assuming the option map's nesting depth."""
+    urls = set()
+
+    def collect(value):
+        if isinstance(value, str) and value:
+            urls.add(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(product.get('images', []))
+    collect(product.get('option_to_image', {}))
+    return urls
+
+
+def _apply_reference_overrides(groups, overrides, catalog, normal_count, test_count):
+    """Replace only B demands; never alter the legal A purchase or its image."""
+    if not overrides:
+        return {}
+    by_number = {group['number']: group for group in groups}
+    if not overrides.keys() <= by_number.keys():
+        raise ValueError('Reference override names a group absent from the selected pairs')
+    source_ids = {group['a'] for group in groups}
+    selected_ids = [entry['asin'] for entry in overrides.values()]
+    if len(selected_ids) != len(set(selected_ids)) or source_ids.intersection(selected_ids):
+        raise ValueError('Reference overrides need distinct B products different from every source A')
+    other_references = {group['b'] for group in groups if group['number'] not in overrides}
+    if other_references.intersection(selected_ids):
+        raise ValueError('Reference override B would change an unselected group reference image')
+    products = {}
+    reference_keys = set()
+    for number, entry in sorted(overrides.items()):
+        group = by_number[number]
+        product, price = catalog.product(entry['asin'])
+        if product.get('asin') != entry['asin']:
+            raise ValueError('Reference override catalog product identity differs from the requested asin')
+        images = product.get('images') or []
+        url = entry.get('image_url')
+        if 'catalog_image_index' in entry:
+            index = entry['catalog_image_index']
+            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(images):
+                raise ValueError(f'Reference override catalog_image_index is invalid for {entry["asin"]}')
+            indexed_url = images[index]
+            if url and url != indexed_url:
+                raise ValueError('Reference override image_url disagrees with catalog_image_index')
+            url = indexed_url
+        if not isinstance(url, str) or not url or url not in _catalog_image_urls(product):
+            raise ValueError(f'Reference override image URL does not belong to catalog product {entry["asin"]}')
+        entry['image_url'] = url
+        goal, options = catalog_product_goal(product, price, entry.get('goal_options'))
+        reference = _task(group['id'], 'reference', 1, None, goal, 'catalog_product_goal')
+        reference['goal_origin'] = {
+            'kind': 'catalog_product_goal', 'fixed_product_asin': entry['asin'],
+            'product_fields_sha256': fingerprint(product), 'catalog_price': float(price),
+            'selected_catalog_options': options, 'reward_is_real_environment_only': True,
+            'reference_goal_sha256': fingerprint(goal),
+            'reviewed_reference_image_url': url, 'reviewed_reference_image_sha256': entry['sha256']}
+        key = canonical_instruction(reference['instruction'])
+        if key in reference_keys:
+            raise ValueError('Reference overrides contain duplicate purchase instructions')
+        reference_keys.add(key)
+        group.update(reference_task=reference, b=entry['asin'], reference_product_asin=entry['asin'],
+                     b_goal_index=None, reference_selection_policy=OVERRIDE_SELECTION_POLICY,
+                     reference_image_override=copy.deepcopy(entry))
+        products[entry['asin']] = product
+    # A reviewed B or its exact demand must not appear in ordinary histories or
+    # evaluation trials, including those belonging to the other groups.
+    for group in groups:
+        protected = [group['training']]
+        if group['number'] not in overrides:
+            protected.append(group['reference_task'])
+        if any(canonical_instruction(task['instruction']) in reference_keys for task in protected):
+            raise ValueError('Reference override instruction conflicts with a training/reference task')
+        removed = {}
+        for kind in ('trials', 'normal_candidates'):
+            tasks = group[kind]
+            group[kind] = [task for task in tasks
+                           if task['asin'] not in selected_ids
+                           and canonical_instruction(task['instruction']) not in reference_keys]
+            removed[kind] = len(tasks) - len(group[kind])
+        if len(group['trials']) != test_count:
+            raise ValueError(f"{group['victim']}: reference override leaves fewer than {test_count} disjoint trials; choose a different seed or candidate")
+        if len(group['normal_candidates']) < normal_count:
+            raise ValueError(f"{group['victim']}: reference override leaves fewer than {normal_count} disjoint normal tasks; choose a different seed or candidate")
+        if any(removed.values()):
+            group['reference_override_exclusions'] = removed
+    return products
+
+
+def _copy_reference_image(entry, root):
+    """Copy reviewed bytes, keeping the catalog and original image untouched."""
+    from PIL import Image
+    source = Path(entry['image_path'])
+    content = source.read_bytes()
+    if hashlib.sha256(content).hexdigest() != entry['sha256']:
+        raise ValueError('Reference override image changed during preparation')
+    with Image.open(BytesIO(content)) as image:
+        extension = {'JPEG': '.jpg', 'PNG': '.png', 'WEBP': '.webp', 'GIF': '.gif'}.get(image.format)
+        if extension is None:
+            raise ValueError('Unsupported reference override image format')
+        image.verify()
+    path = root / 'assets' / (entry['sha256'] + extension)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not _verify_image(path, entry['sha256']):
+        raise ValueError('Existing reviewed reference asset differs from its sha256')
+    if not path.exists():
+        path.write_bytes(content)
+    record = {'asin': entry['asin'], 'url': entry['image_url'], 'source_url': entry['image_url'],
+              'path': path.relative_to(root).as_posix(), 'absolute_path': str(path),
+              'sha256': entry['sha256'], 'bytes': len(content), 'reused_from': str(source),
+              'reviewed_reference_override': True}
+    write(root / 'image_records' / f'{entry["asin"]}.json', record)
+    return record
+
+
 def ensure_image(product, root, direct=False, cache_roots=()):
     """Reuse verified images first; all writes are inside this experiment root."""
     root = _inside_project(root)
@@ -372,10 +539,12 @@ def _backup_legacy_bundle(root, existing):
 def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', normal_count=14,
                    test_count=20, seed=DEFAULT_SEED, direct_images=False, *, catalog_dir,
                    normal_candidate_limit=70, download_images=True, cache_roots=None,
-                   image_workers=6, download_task_images=False, source_history_mode='victim'):
+                   image_workers=6, download_task_images=False, source_history_mode='victim',
+                   reference_overrides=None):
     root = _inside_project(root)
     source = Path(webshop_source).resolve()
     protocol = protocol_for_source_history(source_history_mode)
+    overrides, frozen_overrides = _load_reference_overrides(reference_overrides, source_history_mode)
     pair_file = Path(pair_file or DEFAULT_PAIRS).resolve()
     pairs = read(pair_file)
     catalog_root = Path(catalog_dir).resolve()
@@ -390,6 +559,8 @@ def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', n
     if source_history_mode == 'attacker':
         settings['source_history_mode'] = source_history_mode
         settings['reference_selection_policy'] = REFERENCE_SELECTION_POLICY
+    if frozen_overrides is not None:
+        settings['reference_overrides'] = frozen_overrides
     if (root / 'manifest.json').is_file():
         existing = read(root / 'manifest.json')
         if existing.get('protocol') in (PROTOCOL, ATTACKER_PROTOCOL) and existing.get('protocol') != protocol:
@@ -416,6 +587,7 @@ def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', n
                               normal_count, test_count, seed, normal_candidate_limit,
                               source_history_mode=source_history_mode)
         products = {asin: product for _, asin, product, _ in resolved}
+        products.update(_apply_reference_overrides(groups, overrides, catalog, normal_count, test_count))
         for group in groups:
             for task in _group_tasks(group):
                 if task['asin'] not in products:
@@ -432,7 +604,7 @@ def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', n
                 if _compact(actual_title) != _compact(goal_title):
                     raise ValueError(f"{group['victim']}: reference goal title differs from the real catalog product")
                 group['reference_title_audit'] = {
-                    'selection_policy': REFERENCE_SELECTION_POLICY, 'asin': group['b'],
+                    'selection_policy': group['reference_selection_policy'], 'asin': group['b'],
                     'catalog_title': actual_title, 'goal_title': goal_title,
                     'victim_keyword_matches_catalog_title': True,
                     'goal_title_matches_catalog_title': True,
@@ -458,6 +630,8 @@ def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', n
     images, failures = {}, []
     cache_roots = cache_roots if cache_roots is not None else [PROJECT_ROOT / 'src/output/local20']
     if download_images:
+        for entry in overrides.values():
+            images[entry['asin']] = _copy_reference_image(entry, root)
         # Finish the nine A/B image pairs before downloading other task images.
         batches = [priority_ids]
         if download_task_images:
@@ -465,7 +639,7 @@ def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', n
         for batch_ids in batches:
             with ThreadPoolExecutor(max_workers=image_workers) as pool:
                 jobs = {pool.submit(ensure_image, products[asin], root, direct_images, cache_roots): asin
-                        for asin in batch_ids}
+                        for asin in batch_ids if asin not in images}
                 for job in as_completed(jobs):
                     asin = jobs[job]
                     try:
@@ -493,7 +667,9 @@ def prepare_bundle(root, webshop_source, pair_file=None, normal_mode='victim', n
         for task in _group_tasks(group):
             task['image_record'] = images.get(task['asin'])
             task['query_image'] = images[task['asin']]['absolute_path'] if task['asin'] in images else None
-            task['source_image_url'] = products[task['asin']]['images'][0]
+            task['source_image_url'] = next((entry['image_url'] for entry in overrides.values()
+                                             if entry['asin'] == task['asin']),
+                                            products[task['asin']]['images'][0])
         group['source_image'] = images[group['a']]['absolute_path'] if group['a'] in images else None
         reference_task = group.get('reference_task', group['training'])
         group['query_image'] = reference_task['query_image']
@@ -533,6 +709,7 @@ def main():
     parser.add_argument('--direct-images', action='store_true')
     parser.add_argument('--plan-only', action='store_true')
     parser.add_argument('--download-task-images', action='store_true')
+    parser.add_argument('--reference-overrides', help='Reviewed local B image JSON; catalog_image_index is zero-based')
     args = parser.parse_args()
     manifest = prepare_bundle(args.root, args.webshop_source, args.pair_file, args.normal_mode,
                               args.normal_count, args.test_count, args.seed, args.direct_images,
@@ -540,7 +717,8 @@ def main():
                               normal_candidate_limit=args.normal_candidate_limit,
                               download_images=not args.plan_only,
                               download_task_images=args.download_task_images,
-                              source_history_mode=args.source_history_mode)
+                              source_history_mode=args.source_history_mode,
+                              reference_overrides=args.reference_overrides)
     print(json.dumps({'bundle_id': manifest['bundle_id'], 'groups': len(manifest['groups']),
                       'images_downloaded': manifest['images_downloaded']}, ensure_ascii=False))
 

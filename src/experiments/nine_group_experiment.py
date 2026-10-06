@@ -35,6 +35,10 @@ REUSE_EVALUATION_CODE = {'src/experiments/nine_group_experiment.py',
                           'src/experiments/targeted_queries.py',
                           'src/experiments/purchase_stage_metrics.py',
                           'src/experiments/reserve_evaluation.py'}
+BOUND_HISTORY_REPAIR_CODE = {
+    'src/experiments/nine_group_experiment.py',
+    'src/memory/multimodal_memory.py',
+    'src/experiments/targeted_queries.py'}
 
 
 def attacker_history(group):
@@ -130,7 +134,7 @@ def load_plan(args):
 def execution_settings(args, plan):
     _, template = load_auxiliary(DEFAULT_TEMPLATE)
     model = load_model_config(args.llm_config)
-    return {'version': VERSION, 'protocol': plan['protocol'], 'plan_sha256': fingerprint(plan),
+    settings = {'version': VERSION, 'protocol': plan['protocol'], 'plan_sha256': fingerprint(plan),
             'model': model.public(), 'template': template, 'normal_count': 14, 'payload_count': 1,
             'memory_count': 15, 'test_count': 20, 'attack_steps': args.attack_steps,
             'attack_method': args.method, 'epsilon_levels': args.epsilon_levels,
@@ -155,6 +159,11 @@ def execution_settings(args, plan):
                     PROJECT / 'src/vision/joint_encoder_worker.py',
                     PROJECT / 'src/experiments/purchase_stage_metrics.py',
                     PROJECT / 'src/experiments/reserve_evaluation.py')}}
+    if args.method == 'frequency_momentum':
+        from src.vision.frequency_attack import frequency_settings
+        settings.update(frequency_settings(args.optimization_config,
+            getattr(args, 'frequency_axis_ratio', None), getattr(args, 'frequency_momentum', None)))
+    return settings
 
 
 def freeze_settings(args, root, plan):
@@ -169,15 +178,29 @@ def freeze_settings(args, root, plan):
         after = {key: value for key, value in settings.items() if key != 'code'}
         if before != after:
             raise ValueError('Code-update resume cannot change frozen experiment parameters or task plan')
+        bound_repair = getattr(args, 'allow_bound_history_repair_resume', False)
+        changed_code = {name.replace('\\', '/') for name in previous.get('code', {}) | settings.get('code', {})
+                        if previous.get('code', {}).get(name) != settings.get('code', {}).get(name)}
+        if bound_repair and (previous.get('code', {}).keys() != settings.get('code', {}).keys()
+                            or not changed_code or not changed_code <= BOUND_HISTORY_REPAIR_CODE):
+            raise ValueError('Bound-history repair permits only downloader, collection driver and query-binding code')
+        bound_audits = []
         retained = []
         for folder in sorted((root / 'groups').glob('*')):
             # A code fix can continue unfinished acquisition. Once downstream
             # artifacts are frozen, a fresh root keeps formal runs comparable.
             if any((folder / name).exists() for name in (
-                    'history_binding.json', 'attack_ready.json', 'memory_ready.json', 'targeted_tasks.json')):
+                    'attack_ready.json', 'memory_ready.json', 'targeted_tasks.json')):
                 raise ValueError('Code-update resume requires unfinished collection before history/attack/memory freeze')
             if (folder / 'test_results.json').exists() or any(folder.glob('evaluations/*/test_results.json')):
                 raise ValueError('Code-update resume cannot mix code versions in formal evaluation')
+            if (folder / 'history_binding.json').exists():
+                if not bound_repair:
+                    raise ValueError('Code-update resume requires unfinished collection before history freeze')
+                prepared = next((group for group in plan.get('groups', []) if group['id'] == folder.name), None)
+                if prepared is None or not attacker_history(prepared):
+                    raise ValueError('Bound-history repair needs a verified attacker-history group in the same plan')
+                bound_audits.append(verify_collected_history(args, root, plan, prepared))
             state_path = folder / 'history_state.json'
             if state_path.exists():
                 state = read(state_path)
@@ -195,7 +218,9 @@ def freeze_settings(args, root, plan):
         revisions.append({'previous_settings_sha256': previous_sha, 'new_settings_sha256': fingerprint(settings),
             'previous_code': previous.get('code', {}), 'new_code': settings.get('code', {}),
             'retained_history': retained, 'recorded_at_unix': time.time(),
-            'scope': 'code-only repair before formal history/attack/memory freeze'})
+            'verified_history_bindings': bound_audits, 'changed_code_files': sorted(changed_code),
+            'scope': ('downloader/collection/query-binding repair before attack, memory and evaluation freeze'
+                      if bound_repair else 'code-only repair before formal history/attack/memory freeze')})
         write(revision_path, revisions)
         print('继续部分采集：已归档原代码版本，保留已成功的购买记忆；实验参数保持原值。', flush=True)
     write(path, settings)
@@ -374,6 +399,7 @@ def prepare(args):
                           test_count=20, seed=args.seed, direct_images=args.direct_images,
                           catalog_dir=args.catalog, normal_candidate_limit=args.normal_candidate_limit,
                           source_history_mode=getattr(args, 'source_history_mode', 'attacker'),
+                          reference_overrides=getattr(args, 'reference_overrides', None),
                           cache_roots=[OUTPUT / 'nine_groups_targeted_joint', OUTPUT / 'nine_groups_full',
                                        OUTPUT / 'nine_groups', OUTPUT / 'local20'])
 
@@ -381,13 +407,18 @@ def prepare(args):
 def attack_settings(args, group):
     from src.vision.dual_rag_bridge import DEFAULT_DUAL_ROOT
     config_path = args.optimization_config or DEFAULT_DUAL_ROOT / 'configs/optimization.json'
-    return {'source_sha256': digest(group['source_image']), 'target_sha256': digest(group['query_image']),
+    settings = {'source_sha256': digest(group['source_image']), 'target_sha256': digest(group['query_image']),
             'steps': args.attack_steps, 'method': args.method, 'epsilon_levels': args.epsilon_levels,
             'optimization_config_sha256': digest(config_path)}
+    if args.method == 'frequency_momentum':
+        from src.vision.frequency_attack import frequency_settings
+        settings.update(frequency_settings(args.optimization_config,
+            getattr(args, 'frequency_axis_ratio', None), getattr(args, 'frequency_momentum', None)))
+    return settings
 
 
 def attack(args):
-    from src.vision.dual_rag_bridge import generate_attack
+    from src.vision.frequency_attack import generate_attack
     from src.experiments.visual_memory_experiment import pixel_audit
     root, plan, groups = load_plan(args)
     for group in groups:
@@ -409,9 +440,13 @@ def attack(args):
             print('复用已完成对抗图：' + group['id'], flush=True)
             continue
         print(f"生成第 {group['number']}/9 组对抗图，{args.attack_steps} 步：{group['victim']}", flush=True)
+        frequency_options = {}
+        if args.method == 'frequency_momentum':
+            frequency_options = {'frequency_axis_ratio': getattr(args, 'frequency_axis_ratio', None),
+                                 'frequency_momentum': getattr(args, 'frequency_momentum', None)}
         image, metadata = generate_attack(group['source_image'], group['query_image'], folder / 'attack',
             optimization_config=args.optimization_config, method=args.method, steps=args.attack_steps,
-            epsilon_levels=args.epsilon_levels, device=args.device)
+            epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options)
         if metadata['attack']['steps_completed'] != args.attack_steps:
             raise RuntimeError('Attack did not complete all requested steps')
         audit = pixel_audit(group['source_image'], image, args.epsilon_levels)
@@ -785,6 +820,32 @@ def validate_bank(bank, *, expected_count=15):
             raise ValueError('Every historical purchase must be a real successful purchase')
 
 
+def verify_collected_history(args, root, plan, group):
+    """Read-only proof that a bound clean history and every image remain exact."""
+    from src.memory.multimodal_memory import validated_image_bytes
+    resolve_history_binding(args, root, plan, group, required=True)
+    folder = root / 'groups' / group['id']
+    state_path, memory_path = folder / 'history_state.json', folder / 'history_memory.json'
+    state = read(state_path)
+    if len(state['normal']) != 14 or state.get('designated') is None:
+        raise ValueError('Bound history must retain fourteen normal and one designated purchase')
+    rows = state['normal'] + [state['designated']]
+    validate_bank(rows)
+    if read(memory_path) != rows:
+        raise ValueError('Saved history memory differs from its bound collection state')
+    images = []
+    for row in rows:
+        primary = row.get('PrimaryImage') or {}
+        if (row.get('ImageSubstitution') or row.get('RetrievalImage') != primary
+                or primary.get('ASIN') != row.get('FinalASIN')):
+            raise ValueError('Bound history repair requires exact clean product images')
+        _, _, metadata = validated_image_bytes(primary, memory_path)
+        images.append({'memory_id': row['Id'], 'asin': row['FinalASIN'], 'sha256': metadata['SHA256']})
+    return {'group': group['id'], 'binding_file_sha256': digest(folder / 'history_binding.json'),
+            'state_sha256': digest(state_path), 'memory_file_sha256': digest(memory_path),
+            'all_history_sha256': fingerprint(rows), 'images': images}
+
+
 def materialize_banks(folder, normals, designated, ready, group):
     from src.memory.multimodal_memory import apply_controlled_image_substitution
     from src.experiments.visual_memory_experiment import materialize
@@ -862,11 +923,17 @@ def collect_history_attempt(args, root, group, task, state, state_path, memory_p
             else:
                 state['designated'] = row
     except Exception as exc:
-        # Only typed policy failures (including bounded transient API errors)
-        # may consume a retry and continue. Image/data/audit faults stop safely.
-        recoverable = stage == 'episode' and bool(getattr(exc, 'recoverable', False))
+        from src.memory.multimodal_memory import RecoverableImageDownloadError
+        # A verified transient image transport failure may consume a bounded
+        # attempt. Invalid image bytes, identities, audits and file IO still stop.
+        image_download_failure = isinstance(exc, RecoverableImageDownloadError)
+        recoverable = ((stage == 'episode' and bool(getattr(exc, 'recoverable', False)))
+                       or (stage == 'image_persistence' and image_download_failure))
         record.update(status='technical_error', technical_error=True, error=type(exc).__name__,
                       error_stage=stage, recoverable=recoverable, accepted=False, completed=False, reward=None)
+        if image_download_failure:
+            record.update(technical_error_reason=exc.download_reason,
+                          image_download_attempts=exc.download_attempts)
         partial = getattr(exc, 'partial_memory', None)
         trace = getattr(exc, 'trace', None)
         write(root / 'groups' / group['id'] / 'collection_errors' / (task['session'] + '.json'),
@@ -876,7 +943,8 @@ def collect_history_attempt(args, root, group, task, state, state_path, memory_p
         write(memory_path, state['normal'] + ([state['designated']] if state.get('designated') else []))
         if not recoverable:
             raise
-        print(group['id'] + '：本次模型调用技术失败，已保存失败轨迹；按剩余尝试预算继续。', flush=True)
+        failure_label = '图片下载' if image_download_failure else '模型调用'
+        print(group['id'] + f'：本次{failure_label}技术失败，已保存失败轨迹；按剩余尝试预算继续。', flush=True)
         return False
     write(state_path, state)
     write(memory_path, state['normal'] + ([state['designated']] if state.get('designated') else []))
@@ -896,6 +964,10 @@ def collect(args):
         folder = root / 'groups' / group['id']
         if (folder / 'memory_ready.json').exists():
             verify_banks(folder)
+            continue
+        if (folder / 'history_binding.json').exists():
+            verify_collected_history(args, root, plan, group)
+            print(group['id'] + '：复用已核验的十四条正常历史及一条指定购买历史。', flush=True)
             continue
         state_path = folder / 'history_state.json'
         state = read(state_path) if state_path.exists() else {'normal': [], 'designated': None, 'cursor': 0, 'attempts': []}
@@ -1560,6 +1632,8 @@ def main():
     parser.add_argument('--catalog', type=Path, default=DEFAULT_CATALOG)
     parser.add_argument('--webshop-source', type=Path, default=DEFAULT_SOURCE)
     parser.add_argument('--pair-file', type=Path, default=DATA / 'victim_target_pair/victim_target.json')
+    parser.add_argument('--reference-overrides', type=Path,
+                        help='Reviewed B product/image configuration; requires attacker source history')
     parser.add_argument('--llm-config', type=Path, default=DEFAULT_CONFIG)
     parser.add_argument('--indication_prompt', '--indication-prompt', type=Path, default=DEFAULT_TEMPLATE)
     parser.add_argument('--indication-level', type=int, default=1)
@@ -1567,7 +1641,11 @@ def main():
     parser.add_argument('--group', action='append')
     parser.add_argument('--seed', type=int, default=20261003)
     parser.add_argument('--attack-steps', type=int, default=1000)
-    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency'], default='legacy_pixel')
+    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum'], default='legacy_pixel')
+    parser.add_argument('--frequency-axis-ratio', type=float,
+        help='frequency_momentum only: per-axis DCT bandwidth ratio in (0, 1]; defaults to optimization config')
+    parser.add_argument('--frequency-momentum', type=float,
+        help='frequency_momentum only: gradient momentum in [0, 1]; defaults to 1.0')
     parser.add_argument('--epsilon-levels', type=int, default=16)
     parser.add_argument('--optimization-config', type=Path)
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
@@ -1604,9 +1682,18 @@ def main():
     parser.add_argument('--retry-errors', action='store_true')
     parser.add_argument('--allow-code-update-resume', action='store_true',
                         help='Audit a code-only repair and retain unfinished collection with unchanged parameters')
+    parser.add_argument('--allow-bound-history-repair-resume', action='store_true',
+                        help='Verify and retain bound clean histories for downloader/query-binding repairs before attack/evaluation')
     parser.add_argument('--model-check', action='store_true')
     parser.add_argument('--direct-images', action='store_true')
     args = parser.parse_args()
+    if args.allow_bound_history_repair_resume and not args.allow_code_update_resume:
+        parser.error('Bound-history repair also requires --allow-code-update-resume')
+    if args.method != 'frequency_momentum' and (args.frequency_axis_ratio is not None or args.frequency_momentum is not None):
+        parser.error('Frequency parameters require --method frequency_momentum')
+    if args.method == 'frequency_momentum':
+        from src.vision.frequency_attack import frequency_settings
+        frequency_settings(args.optimization_config, args.frequency_axis_ratio, args.frequency_momentum)
     if args.reuse_frozen_memory and args.stage not in ('evaluate', 'check', 'status'):
         parser.error('Frozen-memory reuse supports only evaluate, check or status; it never recollects or optimizes')
     if args.test_mode == 'heldout' and args.query_specificity == 'vague':

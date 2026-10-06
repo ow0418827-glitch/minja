@@ -244,7 +244,30 @@ def _validate_source(group):
         expected_sha = group.get('source_instruction_sha256')
     if expected_sha and expected_sha != _text_sha256(instruction):
         raise ValueError('Original source instruction digest mismatch')
-    if not training.get('task_id') or training.get('goal_index') is None:
+    catalog_reference = False
+    if attacker_history and training.get('goal_index') is None:
+        origin = training.get('goal_origin') or {}
+        audit = group.get('reference_title_audit') or {}
+        image = group.get('query_image_record') or {}
+        image_sha = image.get('sha256', image.get('SHA256'))
+        image_url = image.get('url', image.get('SourceURL', image.get('source_url')))
+        catalog_reference = (
+            training.get('provenance') == 'catalog_product_goal'
+            and group.get('reference_selection_policy') == 'reviewed_catalog_product_image'
+            and origin.get('kind') == 'catalog_product_goal'
+            and origin.get('fixed_product_asin') == group['b']
+            and re.fullmatch(r'[0-9a-f]{64}', str(origin.get('product_fields_sha256', ''))) is not None
+            and origin.get('reference_goal_sha256') == fingerprint(goal)
+            and origin.get('reward_is_real_environment_only') is True
+            and origin.get('reviewed_reference_image_sha256') == image_sha
+            and bool(image_sha)
+            and origin.get('reviewed_reference_image_url') == image_url
+            and bool(image_url)
+            and audit.get('asin') == group['b']
+            and audit.get('catalog_title') == goal.get('name')
+            and audit.get('victim_keyword_matches_catalog_title') is True
+            and audit.get('goal_title_matches_catalog_title') is True)
+    if not training.get('task_id') or (training.get('goal_index') is None and not catalog_reference):
         raise ValueError('Original source task and real goal index are required')
     if not group.get('id'):
         raise ValueError('Group identity is required')

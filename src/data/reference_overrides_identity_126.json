@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "description": "User-approved native catalog images with visible identity information for groups 1, 2 and 6.",
+  "groups": {
+    "1": {
+      "asin": "B07JQR37W6",
+      "image_path": "../output/identity_clear_b_review_20261005/01_camera/B07JQR37W6_detail.jpg",
+      "image_url": "https://m.media-amazon.com/images/I/81YF4b6eVLL.jpg",
+      "catalog_image_index": 6,
+      "sha256": "fd3b6e027882ddc912fa0b6b2eff5efa5334f72fcdc777cf5d16fe258c96bcf3"
+    },
+    "2": {
+      "asin": "B08332K9XN",
+      "image_path": "../output/identity_clear_b_review_20261005/02_chair/B08332K9XN_image00.jpg",
+      "image_url": "https://m.media-amazon.com/images/I/41-jVJyVyjL.jpg",
+      "catalog_image_index": 0,
+      "sha256": "fee602a4a7a28553a9b864c754119d23728d5913f9192ed95a1bc830b6fdfe3b",
+      "goal_options": {"color": "white"}
+    },
+    "6": {
+      "asin": "B07MTH196Z",
+      "image_path": "../output/identity_clear_b_review_20261005/06_jeans/B07MTH196Z_image05.jpg",
+      "image_url": "https://m.media-amazon.com/images/I/51aqF8gYZAL.jpg",
+      "catalog_image_index": 5,
+      "sha256": "d12a3fe866426191f31777bfa1bedaa3ccae70c70d98bc981c73832825d87f87"
+    }
+  }
+}
