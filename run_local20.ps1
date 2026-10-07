@@ -3,9 +3,13 @@ param(
     [string]$RunName = 'm3_trial01',
     [string]$LlmConfig = (Join-Path $PSScriptRoot 'src\configs\llm.local.json'),
     [int]$AttackSteps = 1000,
-    [ValidateSet('legacy_pixel','fair_pixel','frequency','frequency_momentum')][string]$Method = 'legacy_pixel',
+    [ValidateSet('legacy_pixel','fair_pixel','frequency','frequency_momentum','ssa')][string]$Method = 'legacy_pixel',
     [Nullable[double]]$FrequencyAxisRatio = $null,
     [Nullable[double]]$FrequencyMomentum = $null,
+    [Nullable[int]]$SsaSamples = $null,
+    [Nullable[double]]$SsaRho = $null,
+    [Nullable[double]]$SsaSigma = $null,
+    [Nullable[double]]$SsaMomentum = $null,
     [int]$NumSteps = 20,
     [ValidateRange(1,20)][int]$Trials = 20,
     [ValidateSet('full','fragment')][string]$MemoryMode = 'full',
@@ -18,6 +22,9 @@ param(
 $ErrorActionPreference = 'Stop'
 if ($Method -ne 'frequency_momentum' -and ($null -ne $FrequencyAxisRatio -or $null -ne $FrequencyMomentum)) {
     throw 'FrequencyAxisRatio and FrequencyMomentum require Method frequency_momentum.'
+}
+if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum)) {
+    throw 'SsaSamples, SsaRho, SsaSigma and SsaMomentum require Method ssa.'
 }
 if ($TextBaselineOnly -and $Stage -ne 'Evaluate') { throw 'TextBaselineOnly requires Stage Evaluate.' }
 $env:PYTHONUTF8 = '1'
@@ -35,6 +42,10 @@ $frequencyArgs = @()
 if ($Method -ne 'legacy_pixel') { $frequencyArgs += @('--method', $Method) }
 if ($null -ne $FrequencyAxisRatio) { $frequencyArgs += @('--frequency-axis-ratio', "$FrequencyAxisRatio") }
 if ($null -ne $FrequencyMomentum) { $frequencyArgs += @('--frequency-momentum', "$FrequencyMomentum") }
+if ($null -ne $SsaSamples) { $frequencyArgs += @('--ssa-samples', "$SsaSamples") }
+if ($null -ne $SsaRho) { $frequencyArgs += @('--ssa-rho', "$SsaRho") }
+if ($null -ne $SsaSigma) { $frequencyArgs += @('--ssa-sigma', "$SsaSigma") }
+if ($null -ne $SsaMomentum) { $frequencyArgs += @('--ssa-momentum', "$SsaMomentum") }
 if ($IncludeTextBaseline) { $textBaselineArgs += '--include-text-baseline' }
 if ($TextBaselineOnly) { $textBaselineArgs += '--text-baseline-only' }
 if ($Stage -eq 'Serve') {

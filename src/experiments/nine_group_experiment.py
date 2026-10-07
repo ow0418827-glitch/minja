@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 
 import requests
@@ -34,7 +35,8 @@ REUSE_EVALUATION_FIELDS = {'memory_top_k'}
 REUSE_EVALUATION_CODE = {'src/experiments/nine_group_experiment.py',
                           'src/experiments/targeted_queries.py',
                           'src/experiments/purchase_stage_metrics.py',
-                          'src/experiments/reserve_evaluation.py'}
+                          'src/experiments/reserve_evaluation.py',
+                          'src/experiments/deferred_529.py'}
 BOUND_HISTORY_REPAIR_CODE = {
     'src/experiments/nine_group_experiment.py',
     'src/memory/multimodal_memory.py',
@@ -163,6 +165,10 @@ def execution_settings(args, plan):
         from src.vision.frequency_attack import frequency_settings
         settings.update(frequency_settings(args.optimization_config,
             getattr(args, 'frequency_axis_ratio', None), getattr(args, 'frequency_momentum', None)))
+    if args.method == 'ssa':
+        from src.experiments.visual_memory_experiment import ssa_options
+        from src.vision.ssa_attack import ssa_settings
+        settings.update(ssa_settings(args.optimization_config, **ssa_options(args)))
     return settings
 
 
@@ -275,6 +281,8 @@ def verify_frozen_history_for_evaluation(args, root, plan, groups):
     evaluation_code = dict(current['code'])
     metrics_path = PROJECT / 'src/experiments/purchase_stage_metrics.py'
     evaluation_code[str(metrics_path.relative_to(PROJECT))] = digest(metrics_path)
+    deferred_path = PROJECT / 'src/experiments/deferred_529.py'
+    evaluation_code[str(deferred_path.relative_to(PROJECT))] = digest(deferred_path)
     context = {'version': 1, 'source_root': str(root.resolve()),
         'source_run_settings_sha256': digest(path), 'original_memory_top_k': previous['memory_top_k'],
         'evaluation_memory_top_k': args.memory_top_k, 'evaluation_code': evaluation_code,
@@ -316,6 +324,7 @@ def evaluation_location(args, folder, *, save=False):
 
 
 def evaluation_protocol(args):
+    from src.experiments.deferred_529 import POLICY_VERSION
     protocol = {'test_mode': getattr(args, 'test_mode', 'heldout'),
             'retrieval_encoder': getattr(args, 'retrieval_encoder', 'clip'),
             'memory_key_mode': getattr(args, 'memory_key_mode', 'image'),
@@ -326,7 +335,9 @@ def evaluation_protocol(args):
             'query_image_mode': getattr(args, 'query_image_mode', 'reference'),
             'policy_query_image': getattr(args, 'policy_query_image', False),
             'gme_python': str(getattr(args, 'gme_python', '') or ''),
-            'gme_model': str(getattr(args, 'gme_model', '') or '')}
+            'gme_model': str(getattr(args, 'gme_model', '') or ''),
+            'deferred_529_policy': POLICY_VERSION,
+            'deferred_529_implementation_sha256': digest(PROJECT / 'src/experiments/deferred_529.py')}
     reserve_count = getattr(args, 'reserve_tests', 0)
     if reserve_count:
         protocol.update(reserve_tests=reserve_count, primary_tests=20,
@@ -406,6 +417,8 @@ def prepare(args):
 
 def attack_settings(args, group):
     from src.vision.dual_rag_bridge import DEFAULT_DUAL_ROOT
+    from src.experiments.visual_memory_experiment import ssa_options
+    spectrum_options = ssa_options(args)
     config_path = args.optimization_config or DEFAULT_DUAL_ROOT / 'configs/optimization.json'
     settings = {'source_sha256': digest(group['source_image']), 'target_sha256': digest(group['query_image']),
             'steps': args.attack_steps, 'method': args.method, 'epsilon_levels': args.epsilon_levels,
@@ -414,12 +427,15 @@ def attack_settings(args, group):
         from src.vision.frequency_attack import frequency_settings
         settings.update(frequency_settings(args.optimization_config,
             getattr(args, 'frequency_axis_ratio', None), getattr(args, 'frequency_momentum', None)))
+    if args.method == 'ssa':
+        from src.vision.ssa_attack import ssa_settings
+        settings.update(ssa_settings(args.optimization_config, **spectrum_options))
     return settings
 
 
 def attack(args):
     from src.vision.frequency_attack import generate_attack
-    from src.experiments.visual_memory_experiment import pixel_audit
+    from src.experiments.visual_memory_experiment import pixel_audit, ssa_options
     root, plan, groups = load_plan(args)
     for group in groups:
         group = resolve_history_binding(args, root, plan, group,
@@ -446,7 +462,7 @@ def attack(args):
                                  'frequency_momentum': getattr(args, 'frequency_momentum', None)}
         image, metadata = generate_attack(group['source_image'], group['query_image'], folder / 'attack',
             optimization_config=args.optimization_config, method=args.method, steps=args.attack_steps,
-            epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options)
+            epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options, **ssa_options(args))
         if metadata['attack']['steps_completed'] != args.attack_steps:
             raise RuntimeError('Attack did not complete all requested steps')
         audit = pixel_audit(group['source_image'], image, args.epsilon_levels)
@@ -1154,6 +1170,8 @@ def summarize(rows, planned=20):
 
 
 def evaluate(args):
+    # One explicit command creates one batch; all its groups share this identity.
+    args.deferred_529_batch_id = uuid.uuid4().hex
     root, plan, groups = load_plan(args)
     if getattr(args, 'reuse_frozen_memory', False):
         verify_frozen_history_for_evaluation(args, root, plan, groups)
@@ -1177,8 +1195,346 @@ def evaluate(args):
             close()
 
 
+def is_overload_529(value):
+    """Recognize only provider overload 529, including stored reports and causes."""
+    if isinstance(value, dict):
+        if 'overload_529' in value:
+            return value['overload_529'] is True
+        for key in ('http_status', 'status_code', 'http_code'):
+            if str(value.get(key, '')) == '529':
+                return True
+        if value.get('error'):
+            return bool(re.search(r'(?:Error code:\s*|model_status_|http_status_)529\b',
+                                  str(value.get('message', ''))))
+        return False
+    visited = set()
+    while value is not None and id(value) not in visited:
+        visited.add(id(value))
+        status = getattr(value, 'status_code', None)
+        response = getattr(value, 'response', None)
+        if str(status) == '529' or str(getattr(response, 'status_code', '')) == '529':
+            return True
+        value = getattr(value, '__cause__', None) or getattr(value, '__context__', None)
+    return False
+
+
+class Deferred529Halt(RuntimeError):
+    """A persisted overload stop; the same command may explicitly resume it."""
+
+
+def _deferred_overload_totals(ledger):
+    overloaded = [event for event in ledger.state['attempts'] if event['is_529']]
+    latest = {(slot['task_id'], condition): report
+              for slot in ledger.state['slots'] for condition, report in slot['results'].items()}
+    recovered = sum(not latest[(event.get('task_id'), event.get('condition'))].get('error')
+                    for event in overloaded
+                    if (event.get('task_id'), event.get('condition')) in latest)
+    return {'deferred_overload_events_total': len(overloaded),
+            'recovered_overload_events_total': recovered}
+
+
+def _write_evaluation_output(path, value):
+    """The project's writer already publishes a temporary JSON file by replace."""
+    write(path, value)
+
+
+def _read_evaluation_output(path):
+    try:
+        return read(path)
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
+        return None
+
+
+def _deferred_summary_metadata(report_folder):
+    audits = {path.name.removesuffix('.audit.json'): read(path)
+              for path in sorted(report_folder.glob('*deferred_529_state.json.audit.json'))}
+    if not audits:
+        return {}
+    return {'deferred_529_audits': audits,
+            'deferred_529_audit': audits.get('deferred_529_state.json', {}),
+            'deferred_overload_events_total': sum(audit.get('deferred_overload_events_total', 0)
+                                                 for audit in audits.values()),
+            'recovered_overload_events_total': sum(audit.get('recovered_overload_events_total', 0)
+                                                  for audit in audits.values())}
+
+
+def _save_deferred_trajectories(ledger, report_folder, *, candidate_offset=0):
+    """Keep every committed attempt, while canonical files show the latest attempt."""
+    # On each explicit entry the complete ledger is verified. During this entry,
+    # synchronize only newly committed attempts; full prompts can be megabytes.
+    verified = getattr(ledger, '_driver_archived_attempts', set())
+    saved_rows = [attempt for attempt in ledger.state['attempts'] if attempt['trajectory'] is not None]
+    pending = [attempt for attempt in saved_rows if attempt['attempt_id'] not in verified]
+    affected = {(attempt['candidate_index'], attempt['condition']) for attempt in pending}
+    latest = {}
+    known = {}
+    for saved in saved_rows:
+        if (saved['candidate_index'], saved['condition']) not in affected:
+            continue
+        index = saved['candidate_index'] + candidate_offset
+        condition, row = saved['condition'], saved['trajectory']
+        attempt = saved['attempt_id']
+        if attempt not in verified:
+            archive = report_folder / 'shopping_attempts' / f'{index:02d}_{condition}' / f'{attempt:03d}.json'
+            archived = _read_evaluation_output(archive)
+            if archived is not None and archived != row:
+                raise ValueError('Saved overload attempt trajectory changed')
+            if archived != row:
+                _write_evaluation_output(archive, row)
+        latest[index, condition] = row
+        known.setdefault((index, condition), []).append(row)
+    for (index, condition), row in latest.items():
+        canonical = report_folder / 'shopping' / f'{index:02d}_{condition}.json'
+        current = _read_evaluation_output(canonical)
+        if current is not None and current not in known[index, condition]:
+            raise ValueError('Saved shopping trajectory differs from all committed attempts')
+        if current != row:
+            _write_evaluation_output(canonical, row)
+    ledger._driver_archived_attempts = verified | {attempt['attempt_id'] for attempt in pending}
+
+
+def _evaluation_attempt(args, root, group, rt, report_folder, template, item, index,
+                        condition, ready, bindings, retrievers, *, slot=None,
+                        candidate_role='primary', replaces_task_id=None, phase='primary', round_number=0):
+    """Run one original condition from reset and retain its exact success/failure evidence."""
+    from src.vision.visual_retrieval import VisualMemoryRetriever
+    bank_path = root / 'groups' / group['id'] / (
+        'memory.json' if condition == 'adversarial' else 'clean_memory.json')
+    query = group['query_image']
+    query_sha256 = item.get('query_image_sha256') or group.get('reference_query_sha256')
+    optimization_sha256 = group.get('reference_query_sha256') or query_sha256
+    session = (f"fixed_nine_p{group['number']}_eval_{index}_{condition}_{item['goal_index']}_"
+               + report_folder.name[-16:])
+    task = dict(item, session=session)
+    print(f"{group['id']}：原需求 {item['task_id']}，{condition}，"
+          + ('首次遍历' if phase == 'primary' else f'延期补跑第 {round_number}/2 轮'), flush=True)
+    row, caught = None, None
+    try:
+        optimization_sha256 = digest(group['query_image'])
+        if getattr(args, 'query_image_mode', 'reference') == 'task':
+            from src.experiments.nine_group_prepare import ensure_image
+            from src.environment.disk_catalog import DiskCatalog
+            with DiskCatalog.open(args.catalog) as catalog:
+                record = ensure_image(catalog.product(item['asin']), root, args.direct_images)
+            query = str(root / record['path'])
+        elif item.get('query_image_sha256') and digest(query) != item['query_image_sha256']:
+            raise ValueError('Frozen query image digest changed')
+        query_sha256 = digest(query)
+        bank = [] if condition == 'no_memory' else read(bank_path)
+        if bank and condition not in retrievers:
+            options = ({'key_mode': args.memory_key_mode, 'query_mode': args.memory_query_mode,
+                        'index_text': args.index_text} if hasattr(args, 'test_mode') else {})
+            retrievers[condition] = VisualMemoryRetriever(rt['visual_encoder'], bank_path, **options)
+        _, row, _ = execute_episode(args, root, group, task, bank, bank_path, rt,
+            query_image=query if bank or getattr(args, 'policy_query_image', False) else None,
+            retriever=retrievers.get(condition))
+        report = outcome(row, group, ready['source_memory_id'])
+    except Exception as error:
+        caught = error
+        partial = getattr(error, 'partial_memory', None)
+        row = copy.deepcopy(partial) if isinstance(partial, dict) else None
+        report = outcome(row, group, ready['source_memory_id'])
+        message = str(error)
+        secret = getattr(rt['model'], 'api_key', '')
+        if secret:
+            message = message.replace(secret, '[REDACTED]')
+        overloaded = is_overload_529(error)
+        recoverable, reason = replacement_error_kind(error)
+        if getattr(rt['visual_encoder'], 'closed', False):
+            recoverable, reason, overloaded = False, 'retrieval_encoder_unavailable', False
+        report.update(completed=False, purchased_asin=None, bought_target=False,
+            correct_purchase=False, bought_reference_product=False,
+            memory_associated_target_purchase=False, environment_reward=None,
+            error=type(error).__name__, message=message[:2000], overload_529=overloaded,
+            http_status=529 if overloaded else getattr(error, 'status_code', None),
+            technical_recoverable=recoverable, technical_error_reason=reason,
+            recorded_at_unix=time.time())
+        if isinstance(row, dict):
+            row['EpisodeError'] = {'error': type(error).__name__, 'message': message[:2000],
+                                   'overload_529': overloaded, 'recoverable': recoverable, 'reason': reason}
+    report.update(bindings, task_id=item['task_id'], condition=condition, query_image=query,
+        optimization_target_asin=group['b'], optimization_target_sha256=optimization_sha256,
+        planned_b=group.get('planned_b', group['b']), test_mode=group['test_mode'],
+        expected_asin=item.get('expected_asin', item['asin']), query_specificity=group['query_specificity'],
+        query_image_sha256=query_sha256, query_instruction_sha256=fingerprint(item['instruction']),
+        candidate_index=index + 1, candidate_role=candidate_role,
+        evaluation_slot=slot if slot is not None else index + 1, replaces_task_id=replaces_task_id)
+    if isinstance(row, dict):
+        row['PurchaseStageMetrics'] = report['purchase_stages']
+        row['EvaluationTaskAudit'] = {
+            'query_specificity': group['query_specificity'], 'expected_asin': report['expected_asin'],
+            'original_requirements': item.get('original_requirements'),
+            'original_requirements_visibility': 'audit_only',
+            'correctness_definition': report['correctness_definition'],
+            'candidate_role': candidate_role, 'evaluation_slot': report['evaluation_slot']}
+    return report, row, caught
+
+
+def _verify_existing_formal_results(report_folder, ledger, conditions, *, reserve_trials=None):
+    """Accept a prior committed snapshot, but reject valid JSON with unknown edits."""
+    current = _read_evaluation_output(report_folder / 'test_results.json')
+    if current is None:
+        return
+    if not isinstance(current, dict) or set(current) - set(conditions):
+        raise ValueError('Saved result belongs to another query or evaluation condition')
+    known = [attempt['report'] for attempt in ledger.state['attempts']]
+    known += [report for rows in ledger.final_results().values() for report in rows]
+    reserve_path = report_folder / 'candidate_results.json'
+    if reserve_trials is not None and reserve_path.exists():
+        from src.experiments.reserve_evaluation import ReserveEvaluation
+        reserved = ReserveEvaluation(reserve_path, reserve_trials, conditions, ledger.identity['bindings'])
+        known += [report for candidate in reserved.state['candidates'] for report in candidate['results'].values()]
+        known += [report for rows in reserved.final_results().values() for report in rows]
+    for condition, rows in current.items():
+        if not isinstance(rows, list):
+            raise ValueError('Saved result belongs to another query or has invalid rows')
+        for report in rows:
+            if (isinstance(report, dict) and report.get('history_binding_sha256')
+                    != ledger.identity['bindings'].get('history_binding_sha256')):
+                raise ValueError('Saved result belongs to another observed B history binding')
+            if not isinstance(report, dict) or report.get('condition') != condition or report not in known:
+                raise ValueError('Saved result belongs to another query or differs from every committed report')
+
+
+def run_deferred_candidates(args, root, group, rt, report_folder, template, trials,
+                            tasks_sha256, ready, conditions, encoder_sha256, protocol_sha256,
+                            *, initial_results=None, ledger_name='deferred_529_state.json',
+                            candidate_offset=0, slot=None, candidate_role='primary',
+                            replaces_task_id=None, write_formal_outputs=True, reserve_trials=None):
+    """Run fixed original demands, defer overloads, then perform two bounded retry rounds."""
+    from src.experiments.deferred_529 import Deferred529Evaluation
+    bindings = {'history_binding_sha256': group.get('history_binding_sha256'),
+                'tasks_sha256': tasks_sha256, 'retrieval_protocol_sha256': protocol_sha256,
+                'encoder_sha256': encoder_sha256, 'template_sha256': template['sha256'],
+                'template_level': template['selected_level']}
+    by_id = {item['task_id']: item for item in trials}
+    for condition, rows in (initial_results or {}).items():
+        if condition not in conditions:
+            raise ValueError('Saved result has an unknown evaluation condition')
+        for report in rows:
+            item = by_id.get(report.get('task_id'))
+            if item is None or report.get('condition') != condition:
+                raise ValueError('Saved result belongs to a different heldout task or condition')
+            expected = dict(bindings, query_instruction_sha256=fingerprint(item['instruction']))
+            if any(report.get(key) != value for key, value in expected.items()):
+                raise ValueError('Saved result belongs to another query or retrieval protocol')
+    ledger = Deferred529Evaluation(report_folder / ledger_name, trials, conditions, bindings,
+        initial_results=initial_results, is_529=is_overload_529, primary_count=len(trials),
+        condition_orders=[conditions[(index + candidate_offset) % len(conditions):]
+                          + conditions[:(index + candidate_offset) % len(conditions)]
+                          for index in range(len(trials))])
+    if write_formal_outputs:
+        _verify_existing_formal_results(report_folder, ledger, conditions,
+                                       reserve_trials=reserve_trials if getattr(args, 'reserve_tests', 0) else None)
+    batch_id = getattr(args, 'deferred_529_batch_id', None)
+    if batch_id is None:
+        batch_id = args.deferred_529_batch_id = uuid.uuid4().hex
+    ledger.start_batch(batch_id)
+    retrievers = {}
+
+    def persist():
+        _save_deferred_trajectories(ledger, report_folder, candidate_offset=candidate_offset)
+        formal, audit = ledger.final_results(), ledger.audit()
+        fatal_reports = [report for saved in ledger.state['slots']
+                         for report in saved['results'].values()
+                         if report.get('error') and report.get('technical_recoverable') is False]
+        if fatal_reports:
+            audit.update(status='fatal', halt_reason='nonrecoverable_technical_error',
+                         fatal_task_ids=list(dict.fromkeys(report['task_id'] for report in fatal_reports)))
+        totals = _deferred_overload_totals(ledger)
+        _write_evaluation_output(report_folder / (ledger_name + '.audit.json'), dict(audit, **totals))
+        error_events = []
+        for event in ledger.state['attempts']:
+            if not event['report'].get('error'):
+                continue
+            archived = {key: value for key, value in event.items() if key != 'trajectory'}
+            if event['trajectory'] is not None:
+                index = event['candidate_index'] + candidate_offset
+                archived['trajectory_path'] = (Path('shopping_attempts')
+                    / f"{index:02d}_{event['condition']}" / f"{event['attempt_id']:03d}.json").as_posix()
+            error_events.append(archived)
+        _write_evaluation_output(report_folder / (ledger_name + '.errors.json'),
+              {'policy': 'same_original_demand_529_only', 'events': error_events, **totals})
+        if write_formal_outputs:
+            summary = {condition: summarize(formal[condition]) for condition in conditions}
+            summary.update(_deferred_summary_metadata(report_folder))
+            if audit['status'] != 'completed':
+                for condition in conditions:
+                    summary[condition]['target_purchase_rate'] = None
+            _write_evaluation_output(report_folder / 'test_results.json', formal)
+            _write_evaluation_output(report_folder / 'summary.json', summary)
+        elif (report_folder / 'summary.json').exists():
+            summary = _read_evaluation_output(report_folder / 'summary.json') or {}
+            summary.update(_deferred_summary_metadata(report_folder))
+            _write_evaluation_output(report_folder / 'summary.json', summary)
+        return formal, audit
+
+    _, entry_audit = persist()
+    if entry_audit['status'] == 'fatal':
+        raise RuntimeError('Fatal evaluation error is saved; inspect the deferred error ledger before continuing')
+    while True:
+        attempt = ledger.next_attempt()
+        if attempt is None:
+            break
+        index, condition = attempt['candidate_index'], attempt['condition']
+        ledger.begin(index, condition)
+        report, row, caught = _evaluation_attempt(
+            args, root, group, rt, report_folder, template, trials[index], index + candidate_offset,
+            condition, ready, bindings, retrievers, slot=slot, candidate_role=candidate_role,
+            replaces_task_id=replaces_task_id, phase=attempt['phase'], round_number=attempt['round'])
+        overloaded = is_overload_529(report)
+        has_529_history = ledger.has_529_history(index)
+        if (report.get('error') and not overloaded and has_529_history
+                and report.get('technical_recoverable') is True):
+            report['deferred_after_529'] = True
+        ledger.record_result(index, condition, report, trajectory=row, is_529=overloaded)
+        if (caught is not None and not overloaded and getattr(args, 'reserve_tests', 0)
+                and not has_529_history and not ledger.state['slots'][index]['latest_529']):
+            ledger.exclude_other_error(index)
+        formal, audit = persist()
+        if overloaded:
+            print(f"{group['id']}：需求 {trials[index]['task_id']} 的 {condition} 收到 529 服务过载，"
+                  + ('首次遍历' if attempt['phase'] == 'primary' else f"延期补跑第 {attempt['round']}/2 轮")
+                  + '；已保存失败轨迹并保留原需求。服务响应：'
+                  + report.get('message', '')[:800], flush=True)
+        elif report.get('deferred_after_529'):
+            current_error = (f"HTTP {report['http_status']}" if report.get('http_status')
+                             else report.get('error', '连接或超时错误'))
+            print(f"{group['id']}：需求 {trials[index]['task_id']} 曾收到 529，当前 {condition} "
+                  f"出现 {current_error}，延期补跑第 {attempt['round']}/2 轮；"
+                  '已保存失败轨迹并保留原需求。当前服务响应：'
+                  + report.get('message', '')[:800], flush=True)
+        if caught is not None and not overloaded and report.get('technical_recoverable') is False:
+            if write_formal_outputs and getattr(args, 'reserve_tests', 0):
+                from src.experiments.reserve_evaluation import ReserveEvaluation
+                reserved = ReserveEvaluation(report_folder / 'candidate_results.json', reserve_trials or trials,
+                                             conditions, bindings)
+                filtered = {condition: [row for row in rows if not is_overload_529(row)
+                                       and not (row.get('deferred_after_529') and row.get('error'))]
+                            for condition, rows in formal.items()}
+                _seed_reserve_results(reserved, reserve_trials or trials, conditions, filtered, report_folder)
+                _persist_reserve_outputs(reserved, report_folder, conditions)
+            print(f"{group['id']}：非 529 的不可恢复错误已保存，停止评估。", flush=True)
+            raise caught
+    formal, audit = persist()
+    if audit['status'] == 'halted':
+        reason = audit.get('halt_reason', '')
+        message = (f"{group['id']}：首次遍历连续三个不同需求收到 529，已停止本次运行；"
+                   '全部正常结果及失败轨迹已保存，可重新运行同一命令续跑。'
+                   if 'consecutive' in str(reason) else
+                   f"{group['id']}：原需求经过最多两轮延期补跑仍有 529、曾过载后的可恢复错误或缺失条件，已停止本次运行；"
+                   '正常结果及全部失败轨迹已保存，可重新运行同一命令续跑。')
+        pending = [trials[index - 1]['task_id'] for index in audit.get('pending_slots', [])]
+        message += f" 未完成需求：{', '.join(pending)}；账本：{report_folder / ledger_name}"
+        print(message, flush=True)
+        raise Deferred529Halt(message)
+    return formal, audit, ledger
+
+
 def replacement_error_kind(error):
     """Separate transient infrastructure failures from integrity/programming faults."""
+    if is_overload_529(error):
+        return False, 'deferred_overload_529'
     from openai import APIConnectionError, APITimeoutError, APIStatusError
     if isinstance(error, requests.exceptions.SSLError):
         if 'CERTIFICATE_VERIFY_FAILED' in str(error):
@@ -1203,18 +1559,67 @@ def replacement_error_kind(error):
     return False, 'unclassified_or_integrity_error'
 
 
+def _seed_reserve_results(ledger, trials, conditions, initial, report_folder):
+    """Bridge committed primary reports without sending any new model request."""
+    reports = {condition: {row['task_id']: row for row in initial.get(condition, [])}
+               for condition in conditions}
+    for index, item in enumerate(trials[:20]):
+        if ledger.audit()['status'] == 'fatal':
+            break
+        candidate = ledger.state['candidates'][index]
+        if candidate['status'] in ('accepted', 'excluded_technical'):
+            continue
+        order = conditions[index % len(conditions):] + conditions[:index % len(conditions)]
+        for condition in order:
+            report = reports[condition].get(item['task_id'])
+            if report is None:
+                continue
+            if is_overload_529(report) or (report.get('deferred_after_529') and report.get('error')):
+                raise ValueError('Deferred 529 cannot be replaced by a reserve demand')
+            if condition in candidate['results']:
+                if candidate['results'][condition] != report:
+                    raise ValueError('Committed reserve primary report changed')
+                continue
+            if candidate['status'] != 'pending':
+                break
+            ledger.begin(index)
+            path = report_folder / 'shopping' / f'{index + 1:02d}_{condition}.json'
+            trajectory = read(path) if path.exists() else None
+            ledger.record_result(index, condition, report, trajectory=trajectory)
+            candidate = ledger.state['candidates'][index]
+
+
+def _persist_reserve_outputs(ledger, report_folder, conditions):
+    formal, audit, errors = ledger.final_results(), ledger.audit(), ledger.error_events()
+    summary = {name: summarize(formal[name]) for name in conditions}
+    for name in conditions:
+        summary[name]['candidate_technical_errors'] = sum(event['condition'] == name for event in errors)
+    summary['replacement_audit'] = audit
+    summary.update(_deferred_summary_metadata(report_folder))
+    _write_evaluation_output(report_folder / 'test_results.json', formal)
+    _write_evaluation_output(report_folder / 'technical_errors.json', {
+        'version': 1, 'replacement_policy': 'whole_condition_pair_on_recoverable_technical_error_v1',
+        'events': errors, 'total': len(errors), 'state': audit['status']})
+    _write_evaluation_output(report_folder / 'summary.json', summary)
+    return formal
+
+
 def evaluate_reserve_candidates(args, root, group, rt, report_folder, template,
                                 trials, tasks_sha256, ready, conditions,
-                                encoder_sha256, protocol_sha256):
+                                encoder_sha256, protocol_sha256, *, initial_primary_results=None):
     """Fill twenty paired slots from a frozen, finite candidate pool without resampling failures."""
     from src.experiments.reserve_evaluation import ReserveEvaluation
-    from src.vision.visual_retrieval import VisualMemoryRetriever
     bindings = {'history_binding_sha256': group.get('history_binding_sha256'),
                 'tasks_sha256': tasks_sha256, 'retrieval_protocol_sha256': protocol_sha256,
                 'encoder_sha256': encoder_sha256, 'template_sha256': template['sha256'],
                 'template_level': template['selected_level']}
+    if initial_primary_results is None:
+        initial_primary_results, _, _ = run_deferred_candidates(
+            args, root, group, rt, report_folder, template, trials[:20], tasks_sha256,
+            ready, conditions, encoder_sha256, protocol_sha256, reserve_trials=trials)
     ledger = ReserveEvaluation(report_folder / 'candidate_results.json', trials, conditions, bindings)
-    retrievers = {}
+    if initial_primary_results is not None:
+        _seed_reserve_results(ledger, trials, conditions, initial_primary_results, report_folder)
     query_sha256 = trials[0]['query_image_sha256']
     if any(item['query_image_sha256'] != query_sha256 for item in trials):
         raise ValueError('Reserve candidates must share one frozen B reference image')
@@ -1228,26 +1633,14 @@ def evaluate_reserve_candidates(args, root, group, rt, report_folder, template,
                 raise ValueError('Saved reserve result belongs to another query or protocol')
     for saved in ledger.saved_trajectories():
         path = report_folder / 'shopping' / f"{saved['candidate_index']:02d}_{saved['condition']}.json"
-        if path.exists():
-            if read(path) != saved['trajectory']:
-                raise ValueError('Saved shopping trajectory disagrees with the reserve ledger')
-        else:
-            write(path, saved['trajectory'])
+        current = _read_evaluation_output(path)
+        if current is not None and current != saved['trajectory']:
+            raise ValueError('Saved shopping trajectory disagrees with the reserve ledger')
+        if current is None:
+            _write_evaluation_output(path, saved['trajectory'])
 
     def persist_outputs():
-        formal = ledger.final_results()
-        audit = ledger.audit()
-        errors = ledger.error_events()
-        summary = {name: summarize(formal[name]) for name in conditions}
-        for name in conditions:
-            summary[name]['candidate_technical_errors'] = sum(event['condition'] == name for event in errors)
-        summary['replacement_audit'] = audit
-        write(report_folder / 'test_results.json', formal)
-        write(report_folder / 'technical_errors.json', {
-            'version': 1, 'replacement_policy': 'whole_condition_pair_on_recoverable_technical_error_v1',
-            'events': errors, 'total': len(errors), 'state': audit['status']})
-        write(report_folder / 'summary.json', summary)
-        return formal
+        return _persist_reserve_outputs(ledger, report_folder, conditions)
 
     if ledger.audit()['status'] == 'fatal':
         persist_outputs()
@@ -1261,87 +1654,35 @@ def evaluate_reserve_candidates(args, root, group, rt, report_folder, template,
         if candidate['status'] == 'fatal':
             raise RuntimeError('Fatal candidate cannot be silently replaced')
         order = conditions[index % len(conditions):] + conditions[:index % len(conditions)]
+        initial = {condition: [candidate['results'][condition]] if condition in candidate['results'] else []
+                   for condition in conditions}
+        deferred, _, _ = run_deferred_candidates(
+            args, root, group, rt, report_folder, template, [item], tasks_sha256, ready, conditions,
+            encoder_sha256, protocol_sha256, initial_results=initial,
+            ledger_name=f'reserve_{index + 1:02d}_deferred_529_state.json',
+            candidate_offset=index, slot=candidate['slot'], candidate_role=candidate['role'],
+            replaces_task_id=candidate['replaces_task_id'], write_formal_outputs=False)
         for condition in order:
-            candidate = ledger.begin(index)
+            candidate = ledger.state['candidates'][index]
+            if candidate['status'] != 'pending':
+                break
             if condition in candidate['results']:
-                saved = candidate['results'][condition]
-                expected = dict(bindings, task_id=item['task_id'], condition=condition,
-                                query_instruction_sha256=fingerprint(item['instruction']))
-                if any(saved.get(key) != value for key, value in expected.items()):
-                    raise ValueError('Saved reserve result belongs to another query or protocol')
                 continue
-            bank_path = root / 'groups' / group['id'] / (
-                'memory.json' if condition == 'adversarial' else 'clean_memory.json')
-            query = group['query_image']
-            session = (f"fixed_nine_p{group['number']}_eval_{index}_{condition}_{item['goal_index']}_"
-                       + report_folder.name[-16:])
-            task = dict(item, session=session)
-            print(f"{group['id']}：{candidate['role']} 候选 {index + 1}/{len(trials)}，"
-                  f"正式位置 {candidate['slot']}/20，{condition}", flush=True)
-            fatal = None
-            row = None
-            try:
-                if digest(query) != query_sha256:
-                    raise ValueError('Frozen query image digest changed')
-                bank = [] if condition == 'no_memory' else read(bank_path)
-                if bank and condition not in retrievers:
-                    retrievers[condition] = VisualMemoryRetriever(rt['visual_encoder'], bank_path,
-                        key_mode=args.memory_key_mode, query_mode=args.memory_query_mode,
-                        index_text=args.index_text)
-                _, row, _ = execute_episode(args, root, group, task, bank, bank_path, rt,
-                    query_image=query if bank or args.policy_query_image else None,
-                    retriever=retrievers.get(condition))
-                report = outcome(row, group, ready['source_memory_id'])
-                if isinstance(row, dict):
-                    row['PurchaseStageMetrics'] = report['purchase_stages']
-                    row['EvaluationTaskAudit'] = {
-                        'query_specificity': group['query_specificity'],
-                        'expected_asin': item.get('expected_asin', item['asin']),
-                        'original_requirements': item.get('original_requirements'),
-                        'original_requirements_visibility': 'audit_only',
-                        'correctness_definition': report['correctness_definition'],
-                        'candidate_role': candidate['role'], 'evaluation_slot': candidate['slot']}
-            except Exception as error:
-                recoverable, reason = replacement_error_kind(error)
-                if getattr(rt['visual_encoder'], 'closed', False):
-                    recoverable, reason = False, 'retrieval_encoder_unavailable'
-                partial = getattr(error, 'partial_memory', None)
-                row = copy.deepcopy(partial) if isinstance(partial, dict) else None
-                report = outcome(row, group, ready['source_memory_id'])
-                message = str(error)
-                secret = getattr(rt['model'], 'api_key', '')
-                if secret:
-                    message = message.replace(secret, '[REDACTED]')
-                report.update(completed=False, purchased_asin=None, bought_target=False,
-                    correct_purchase=False, bought_reference_product=False,
-                    memory_associated_target_purchase=False, error=type(error).__name__,
-                    message=message[:2000], technical_recoverable=recoverable,
-                    technical_error_reason=reason, recorded_at_unix=time.time())
-                if isinstance(row, dict):
-                    row['EpisodeError'] = {'error': type(error).__name__, 'message': message[:2000],
-                                           'recoverable': recoverable, 'reason': reason}
-                if not recoverable:
-                    fatal = error
-            report.update(bindings, task_id=item['task_id'], condition=condition, query_image=query,
-                optimization_target_asin=group['b'], optimization_target_sha256=query_sha256,
-                planned_b=group.get('planned_b', group['b']), test_mode=group['test_mode'],
-                expected_asin=item.get('expected_asin', item['asin']),
-                query_specificity=group['query_specificity'], query_image_sha256=query_sha256,
-                query_instruction_sha256=fingerprint(item['instruction']),
-                candidate_index=index + 1, candidate_role=candidate['role'],
-                evaluation_slot=candidate['slot'], replaces_task_id=candidate['replaces_task_id'])
-            # Commit the result first. A restart never resamples a committed normal outcome.
+            rows = deferred[condition]
+            if not rows:
+                continue
+            report = rows[0]
+            if is_overload_529(report):
+                raise ValueError('Deferred 529 cannot be sent to reserve replacement')
+            path = report_folder / 'shopping' / f'{index + 1:02d}_{condition}.json'
+            row = read(path) if path.exists() else None
             ledger.record_result(index, condition, report, trajectory=row)
-            if isinstance(row, dict):
-                write(report_folder / 'shopping' / f'{index + 1:02d}_{condition}.json', row)
             persist_outputs()
             if report.get('error'):
-                print(f"{group['id']}：记录技术异常 {report['error']}，候选 {index + 1}，"
-                      f"位置 {candidate['slot']}；"
-                      + ('整条配对排除并按顺序使用备用需求。' if fatal is None
-                         else '该故障不能自动替换，已保存后停止。'), flush=True)
-                if fatal is not None:
-                    raise fatal
+                print(f"{group['id']}：非 529 技术异常 {report['error']} 已保存，"
+                      f"候选 {index + 1}、原位置 {candidate['slot']}。", flush=True)
+                if report.get('technical_recoverable') is False:
+                    raise RuntimeError('Fatal reserve evaluation error is saved; inspect technical_errors.json')
                 break
     formal = persist_outputs()
     audit = ledger.audit()
@@ -1352,7 +1693,6 @@ def evaluate_reserve_candidates(args, root, group, rt, report_folder, template,
 
 
 def evaluate_groups(args, root, plan, groups, rt):
-    from src.vision.visual_retrieval import VisualMemoryRetriever
     for group in groups:
         group = resolve_history_binding(args, root, plan, group,
             required=getattr(args, 'history_product_mode', 'planned') == 'observed')
@@ -1379,105 +1719,28 @@ def evaluate_groups(args, root, plan, groups, rt):
             raise ValueError('Frozen retrieval encoder or targeted tasks changed')
         write(retrieval_path, retrieval_metadata)
         reports_path = report_folder / 'test_results.json'
+        if getattr(args, 'reserve_tests', 0) and (report_folder / 'candidate_results.json').exists():
+            if any(candidate.get('status') == 'fatal'
+                   for candidate in read(report_folder / 'candidate_results.json').get('candidates', [])):
+                raise RuntimeError('Fatal evaluation error is saved; inspect technical_errors.json before continuing')
+        primary_initial = (read(reports_path) if reports_path.exists()
+                           and not (report_folder / 'deferred_529_state.json').exists() else None)
+        results, _, _ = run_deferred_candidates(
+            args, root, group, rt, report_folder, template, trials[:20], tasks_sha256,
+            ready, conditions, encoder_sha256, protocol_sha256, initial_results=primary_initial,
+            reserve_trials=trials)
         if getattr(args, 'reserve_tests', 0):
             results = evaluate_reserve_candidates(args, root, group, rt, report_folder, template,
-                trials, tasks_sha256, ready, conditions, encoder_sha256, protocol_sha256)
-        else:
-            results = read(reports_path) if reports_path.exists() else {name: [] for name in conditions}
-            for name in conditions:
-                results.setdefault(name, [])
-            retrievers = {}
-            for index, item in enumerate(trials):
-                order = conditions[index % len(conditions):] + conditions[:index % len(conditions)]
-                for condition in order:
-                    if len(results[condition]) > index:
-                        saved = results[condition][index]
-                        if saved.get('task_id') != item['task_id'] or saved.get('condition') != condition:
-                            raise ValueError('Saved test order or demand changed; results cannot be reused')
-                        if saved.get('history_binding_sha256') != group.get('history_binding_sha256'):
-                            raise ValueError('Saved test belongs to another observed B purchase')
-                        if (saved.get('template_sha256') != template['sha256']
-                                or saved.get('template_level') != template['selected_level']):
-                            raise ValueError('Saved test belongs to another text template')
-                        if hasattr(args, 'test_mode') and (saved.get('tasks_sha256') != tasks_sha256
-                                or saved.get('retrieval_protocol_sha256') != protocol_sha256
-                                or saved.get('encoder_sha256') != encoder_sha256
-                                or saved.get('query_instruction_sha256') != fingerprint(item['instruction'])):
-                            raise ValueError('Saved test belongs to another query or retrieval protocol')
-                        if not (getattr(args, 'retry_errors', False) and saved.get('error')):
-                            continue
-                    bank_path = folder / ('memory.json' if condition == 'adversarial' else 'clean_memory.json')
-                    bank = [] if condition == 'no_memory' else read(bank_path)
-                    if bank and condition not in retrievers:
-                        if hasattr(args, 'test_mode'):
-                            retrievers[condition] = VisualMemoryRetriever(rt['visual_encoder'], bank_path,
-                                key_mode=args.memory_key_mode, query_mode=args.memory_query_mode,
-                                index_text=args.index_text)
-                        else:
-                            retrievers[condition] = VisualMemoryRetriever(rt['visual_encoder'], bank_path)
-                    retriever = retrievers.get(condition)
-                    query = group['query_image']
-                    session = f"fixed_nine_p{group['number']}_eval_{index}_{condition}_{item['goal_index']}"
-                    if independent_tasks:
-                        session += '_' + report_folder.name[-16:]
-                    task = dict(item, session=session)
-                    print(f"{group['id']}：{condition} 测试 {index + 1}/20", flush=True)
-                    try:
-                        if args.query_image_mode == 'task':
-                            from src.experiments.nine_group_prepare import ensure_image
-                            from src.environment.disk_catalog import DiskCatalog
-                            with DiskCatalog.open(args.catalog) as catalog:
-                                record = ensure_image(catalog.product(item['asin']), root, args.direct_images)
-                            query = str(root / record['path'])
-                        _, row, _ = execute_episode(args, root, group, task, bank, bank_path, rt,
-                            query_image=query if bank or args.policy_query_image else None, retriever=retriever)
-                        report = outcome(row, group, ready['source_memory_id'])
-                        report.update(task_id=item['task_id'], condition=condition, query_image=query)
-                        if isinstance(row, dict):
-                            row['PurchaseStageMetrics'] = report['purchase_stages']
-                            row['EvaluationTaskAudit'] = {'query_specificity': group['query_specificity'],
-                                'expected_asin': item.get('expected_asin', item['asin']),
-                                'original_requirements': item.get('original_requirements'),
-                                'original_requirements_visibility': 'audit_only',
-                                'correctness_definition': report['correctness_definition']}
-                        write(report_folder / 'shopping' / f'{index + 1:02d}_{condition}.json', row)
-                    except Exception as error:
-                        message = str(error).replace(rt['model'].api_key, '[REDACTED]')
-                        partial = getattr(error, 'partial_memory', None)
-                        report = outcome(partial if isinstance(partial, dict) else None,
-                                         group, ready['source_memory_id'])
-                        if isinstance(partial, dict):
-                            partial = copy.deepcopy(partial)
-                            partial['PurchaseStageMetrics'] = report['purchase_stages']
-                            partial['EpisodeError'] = {'error': type(error).__name__, 'message': message}
-                            write(report_folder / 'shopping' / f'{index + 1:02d}_{condition}.json', partial)
-                        # Preserve retrieval exposure/ranks from a failed trajectory,
-                        # while technical failures remain outside valid purchases.
-                        report.update(task_id=item['task_id'], condition=condition, query_image=query,
-                            completed=False, bought_target=False, correct_purchase=False,
-                            bought_reference_product=False, memory_associated_target_purchase=False,
-                            environment_reward=None, error=type(error).__name__, message=message)
-                    if len(results[condition]) > index:
-                        results[condition][index] = report
-                    else:
-                        results[condition].append(report)
-                    report.update(history_binding_sha256=group.get('history_binding_sha256'),
-                        optimization_target_asin=group['b'], optimization_target_sha256=digest(group['query_image']),
-                        planned_b=group.get('planned_b', group['b']), template_sha256=template['sha256'],
-                        template_level=template['selected_level'], test_mode=group['test_mode'],
-                        expected_asin=item.get('expected_asin', item['asin']),
-                        query_specificity=group['query_specificity'],
-                        query_image_sha256=digest(query), query_instruction_sha256=fingerprint(item['instruction']),
-                        tasks_sha256=tasks_sha256, retrieval_protocol_sha256=protocol_sha256,
-                        encoder_sha256=encoder_sha256)
-                    write(reports_path, results)
-                    write(report_folder / 'summary.json', {name: summarize(value) for name, value in results.items()})
+                trials, tasks_sha256, ready, conditions, encoder_sha256, protocol_sha256,
+                initial_primary_results=results)
         if args.include_controls:
             summary = read(report_folder / 'summary.json')
             rates = [summary[name]['target_purchase_rate'] for name in ('adversarial', 'clean')]
             summary['target_purchase_increment'] = rates[0] - rates[1] if all(r is not None for r in rates) else None
-            summary['correct_to_target_error_pairs'] = sum(bool(c.get('correct_purchase') and a.get('bought_target'))
-                for c, a in zip(results['clean'], results['adversarial']))
+            adversarial_by_task = {row['task_id']: row for row in results['adversarial']}
+            summary['correct_to_target_error_pairs'] = sum(
+                bool(row.get('correct_purchase') and adversarial_by_task.get(row['task_id'], {}).get('bought_target'))
+                for row in results['clean'])
             write(report_folder / 'summary.json', summary)
         summary = read(report_folder / 'summary.json')
         summary['test_design'] = {'test_mode': group['test_mode'], 'wordings': 20,
@@ -1539,6 +1802,41 @@ def status(args):
             result['status'] = 'reserve_exhausted'
         elif result['status'] == 'completed' and result['technical_errors_total']:
             result['status'] = 'completed_with_replacements'
+    deferred_audits = [audit for group in result['groups']
+                       for audit in group['tests'].get('deferred_529_audits', {}).values()]
+    if deferred_audits:
+        conditions = ('no_memory', 'clean', 'adversarial') if args.include_controls else ('adversarial',)
+        result['planned_condition_tests'] = len(conditions) * result['planned_primary_tests']
+        result['executed_condition_tests'] = sum(
+            group['tests'].get(condition, {}).get('executed_tests', 0)
+            for group in result['groups'] for condition in conditions)
+        result['condition_technical_errors'] = sum(
+            group['tests'].get(condition, {}).get('technical_errors', 0)
+            for group in result['groups'] for condition in conditions)
+        result['deferred_overload_events_total'] = sum(
+            group['tests'].get('deferred_overload_events_total', 0) for group in result['groups'])
+        result['recovered_overload_events_total'] = sum(
+            group['tests'].get('recovered_overload_events_total', 0) for group in result['groups'])
+        halted = [audit for audit in deferred_audits if audit.get('status') == 'halted']
+        fatal = [audit for audit in deferred_audits if audit.get('status') == 'fatal']
+        pending = any(audit.get('status') in ('pending', 'deferred') for audit in deferred_audits)
+        all_conditions_finished = all(
+            group['tests'].get(condition, {}).get('executed_tests', 0) == 20
+            for group in result['groups'] for condition in conditions)
+        if fatal:
+            result['status'] = 'stopped_with_fatal_error'
+            result['target_purchase_rate'] = None
+        elif result['status'] != 'stopped_with_fatal_error':
+            if halted:
+                result['status'] = 'stopped_with_deferred_529'
+                result['deferred_halt_reasons'] = [audit.get('halt_reason') for audit in halted]
+                result['target_purchase_rate'] = None
+            elif pending or not all_conditions_finished:
+                if result['status'] != 'reserve_exhausted':
+                    result['status'] = 'incomplete'
+                result['target_purchase_rate'] = None
+            elif result['status'] == 'completed' and result['condition_technical_errors']:
+                result['status'] = 'completed_with_errors'
     if (getattr(args, 'reserve_tests', 0) or getattr(args, 'reuse_frozen_memory', False)
             or getattr(args, 'query_specificity', 'strict') != 'strict'):
         if getattr(args, 'reuse_frozen_memory', False):
@@ -1641,11 +1939,19 @@ def main():
     parser.add_argument('--group', action='append')
     parser.add_argument('--seed', type=int, default=20261003)
     parser.add_argument('--attack-steps', type=int, default=1000)
-    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum'], default='legacy_pixel')
+    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum', 'ssa'], default='legacy_pixel')
     parser.add_argument('--frequency-axis-ratio', type=float,
         help='frequency_momentum only: per-axis DCT bandwidth ratio in (0, 1]; defaults to optimization config')
     parser.add_argument('--frequency-momentum', type=float,
         help='frequency_momentum only: gradient momentum in [0, 1]; defaults to 1.0')
+    parser.add_argument('--ssa-samples', type=int,
+        help='ssa only: spectrum simulations per step; defaults to optimization config or 20')
+    parser.add_argument('--ssa-rho', type=float,
+        help='ssa only: multiplicative spectrum mask range; defaults to optimization config or 0.5')
+    parser.add_argument('--ssa-sigma', type=float,
+        help='ssa only: Gaussian noise standard deviation in 8-bit pixel levels; default 16')
+    parser.add_argument('--ssa-momentum', type=float,
+        help='ssa only: gradient momentum in [0, 1]; defaults to optimization config or 1.0')
     parser.add_argument('--epsilon-levels', type=int, default=16)
     parser.add_argument('--optimization-config', type=Path)
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda')
@@ -1694,6 +2000,14 @@ def main():
     if args.method == 'frequency_momentum':
         from src.vision.frequency_attack import frequency_settings
         frequency_settings(args.optimization_config, args.frequency_axis_ratio, args.frequency_momentum)
+    from src.experiments.visual_memory_experiment import ssa_options
+    try:
+        spectrum_options = ssa_options(args)
+        if args.method == 'ssa':
+            from src.vision.ssa_attack import ssa_settings
+            ssa_settings(args.optimization_config, **spectrum_options)
+    except ValueError as error:
+        parser.error(str(error))
     if args.reuse_frozen_memory and args.stage not in ('evaluate', 'check', 'status'):
         parser.error('Frozen-memory reuse supports only evaluate, check or status; it never recollects or optimizes')
     if args.test_mode == 'heldout' and args.query_specificity == 'vague':

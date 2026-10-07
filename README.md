@@ -26,6 +26,8 @@ We conducted our experiments on three agents: RAP Agent, EHR Agent, and QA Agent
 
 # Citation
 
+新增可选 SSA(频谱模拟攻击)，保留原频域扰动指令接口。旧乙图第 1、2、6 组完整三条件实验可通过 `run_old_b_frequency_126.ps1(旧乙图三组实验脚本)`传入 `-Method ssa(选择频谱模拟方法参数)`启动；通用入口未指定参考图覆盖时默认旧乙图，新乙图专用脚本明确固定使用新图。参数、官方来源与完整运行示例见[频谱模拟方法说明](docs/SSA_OPTIMIZATION.md)。
+
 ```bash
 @inproceedings{dong2025memory,
   title={Memory Injection Attacks on LLM Agents via Query-Only Interaction},
@@ -34,3 +36,4 @@ We conducted our experiments on three agents: RAP Agent, EHR Agent, and QA Agent
   year={2025}
 }
 ```
+[529 服务过载的延后补跑与断点续跑](docs/529_RECOVERY.md)：收到过载时保留原需求，先继续其他正式需求，再最多补两轮；连续三个需求过载或额度耗尽时保存并退出，支持同目录续跑。

@@ -62,6 +62,8 @@ def normal_memory_target(run, state, config):
 
 
 def context(args):
+    from src.experiments.visual_memory_experiment import ssa_options
+    spectrum_options = ssa_options(args)
     conditions = experiment_conditions(args)
     if getattr(args, 'text_baseline_only', False) and getattr(args, 'stage', None) != 'evaluate':
         raise ValueError('text-baseline-only requires evaluate to reuse existing memories')
@@ -95,6 +97,9 @@ def context(args):
         from src.vision.frequency_attack import frequency_settings
         settings.update(frequency_settings(frequency_axis_ratio=getattr(args, 'frequency_axis_ratio', None),
             frequency_momentum=getattr(args, 'frequency_momentum', None)))
+    if method == 'ssa':
+        from src.vision.ssa_attack import ssa_settings
+        settings.update(ssa_settings(**spectrum_options))
     if getattr(args, 'stage', None) == 'evaluate':
         source_name = args.source_run
         if not source_name or Path(source_name).name != source_name or source_name in ('.', '..'):
@@ -116,6 +121,10 @@ def context(args):
             for key in ('frequency_axis_ratio', 'frequency_momentum', 'frequency_implementation_sha256'):
                 if source_settings.get(key) != settings[key]:
                     raise ValueError('Requested frequency settings do not match the frozen source attack')
+        if method == 'ssa':
+            for key in ssa_settings(**spectrum_options):
+                if source_settings.get(key) != settings[key]:
+                    raise ValueError('Requested SSA settings do not match the frozen source attack')
         args.experiment = str(source / 'visual')
         settings.update(source_run=source_name, source_manifest_sha256=fingerprint(manifest),
                         normal_memory_count=read(source / 'memory_ready.json')['normal_count'],
@@ -338,6 +347,8 @@ def batch(args):
 
 
 def run_all(args):
+    from src.experiments.visual_memory_experiment import ssa_options
+    spectrum_options = ssa_options(args)
     root, run, config, tasks = context(args)
     base = [sys.executable, '-u', '-m', 'src.experiments.local_experiment']
     shared = ['--root', str(root), '--run-name', args.run_name, '--llm-config', str(Path(args.llm_config).resolve()),
@@ -350,6 +361,9 @@ def run_all(args):
         attack_options += ['--frequency-axis-ratio', str(args.frequency_axis_ratio)]
     if getattr(args, 'frequency_momentum', None) is not None:
         attack_options += ['--frequency-momentum', str(args.frequency_momentum)]
+    for name, value in spectrum_options.items():
+        if value is not None:
+            attack_options += ['--' + name.replace('_', '-'), str(value)]
     shared += attack_options
     shared += ['--text-top-k', str(text_top_k(args))]
     if getattr(args, 'include_text_baseline', False):
@@ -373,11 +387,19 @@ def main():
     parser.add_argument('--llm-config', default=str(DEFAULT_CONFIG))
     parser.add_argument('--num-steps', type=int, default=20)
     parser.add_argument('--attack-steps', type=int, default=1000)
-    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum'], default='legacy_pixel')
+    parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum', 'ssa'], default='legacy_pixel')
     parser.add_argument('--frequency-axis-ratio', type=float,
         help='frequency_momentum only: per-axis DCT bandwidth ratio in (0, 1]; defaults to optimization config')
     parser.add_argument('--frequency-momentum', type=float,
         help='frequency_momentum only: gradient momentum in [0, 1]; defaults to 1.0')
+    parser.add_argument('--ssa-samples', type=int,
+        help='ssa only: spectrum simulations per step; defaults to optimization config or 20')
+    parser.add_argument('--ssa-rho', type=float,
+        help='ssa only: multiplicative spectrum mask range; defaults to optimization config or 0.5')
+    parser.add_argument('--ssa-sigma', type=float,
+        help='ssa only: Gaussian noise standard deviation in 8-bit pixel levels; default 16')
+    parser.add_argument('--ssa-momentum', type=float,
+        help='ssa only: gradient momentum in [0, 1]; defaults to optimization config or 1.0')
     parser.add_argument('--source-run', default='m3_1000steps_trial01')
     parser.add_argument('--trials', type=int, choices=range(1, 21), default=20)
     parser.add_argument('--memory-mode', choices=['full', 'fragment'], default='full')
@@ -391,6 +413,14 @@ def main():
         from src.vision.frequency_attack import frequency_settings
         frequency_settings(frequency_axis_ratio=args.frequency_axis_ratio,
                            frequency_momentum=args.frequency_momentum)
+    from src.experiments.visual_memory_experiment import ssa_options
+    try:
+        spectrum_options = ssa_options(args)
+        if args.method == 'ssa':
+            from src.vision.ssa_attack import ssa_settings
+            ssa_settings(**spectrum_options)
+    except ValueError as error:
+        parser.error(str(error))
     if args.num_steps < 1 or args.attack_steps < 1 or args.text_top_k < 1:
         parser.error('steps must be positive')
     {'run': run_all, 'train': train, 'batch': batch, 'evaluate': batch}[args.stage](args)

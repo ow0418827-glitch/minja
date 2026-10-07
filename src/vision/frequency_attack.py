@@ -40,8 +40,21 @@ def quantize_image(image):
 def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
                     optimization_config=None, method="legacy_pixel", steps=1000,
                     epsilon_levels=16, device=None, frequency_axis_ratio=None,
-                    frequency_momentum=None):
+                    frequency_momentum=None, ssa_samples=None, ssa_rho=None,
+                    ssa_sigma=None, ssa_momentum=None):
     from src.vision import dual_rag_bridge
+    ssa_options = dict(ssa_samples=ssa_samples, ssa_rho=ssa_rho,
+                       ssa_sigma=ssa_sigma, ssa_momentum=ssa_momentum)
+    if method == "ssa":
+        if frequency_axis_ratio is not None or frequency_momentum is not None:
+            raise ValueError("低频参数仅可用于 frequency_momentum 方法")
+        from src.vision.ssa_attack import generate_attack as generate_ssa_attack
+        return generate_ssa_attack(
+            source, target, output_dir, root=root, optimization_config=optimization_config,
+            method=method, steps=steps, epsilon_levels=epsilon_levels, device=device,
+            **ssa_options)
+    if any(value is not None for value in ssa_options.values()):
+        raise ValueError("频谱模拟参数仅可用于 ssa 方法")
     if method != METHOD:
         if frequency_axis_ratio is not None or frequency_momentum is not None:
             raise ValueError("频域增强参数仅可用于 frequency_momentum 方法")

@@ -130,6 +130,17 @@ def encoder_from_args(args):
     return make_encoder(args.dual_rag_root, args.optimization_config, args.surrogate, args.device)
 
 
+def ssa_options(args):
+    """Return only the selected method's options; reject unused explicit parameters."""
+    options = {name: getattr(args, name, None) for name in
+               ('ssa_samples', 'ssa_rho', 'ssa_sigma', 'ssa_momentum')}
+    if getattr(args, 'method', 'legacy_pixel') != 'ssa':
+        if any(value is not None for value in options.values()):
+            raise ValueError('SSA parameters require --method ssa')
+        return {}
+    return options
+
+
 def paired_ranking(clean, poisoned, output, query_image, instruction, encoder, memory_id,
                    key_mode='image', query_mode='image', top_k=1):
     results = {}
@@ -149,6 +160,7 @@ def paired_ranking(clean, poisoned, output, query_image, instruction, encoder, m
 
 def prepare(args):
     frequency_options = {}
+    spectrum_options = ssa_options(args)
     if getattr(args, 'method', 'legacy_pixel') == 'frequency_momentum':
         frequency_options = {'frequency_axis_ratio': getattr(args, 'frequency_axis_ratio', None),
                              'frequency_momentum': getattr(args, 'frequency_momentum', None)}
@@ -156,6 +168,11 @@ def prepare(args):
     elif (getattr(args, 'frequency_axis_ratio', None) is not None
             or getattr(args, 'frequency_momentum', None) is not None):
         raise ValueError('Frequency parameters require --method frequency_momentum')
+    if getattr(args, 'method', 'legacy_pixel') == 'ssa':
+        from src.vision.ssa_attack import ssa_settings
+        ssa_settings(args.optimization_config, root=args.dual_rag_root, **spectrum_options)
+        if args.adversarial_image and any(value is not None for value in spectrum_options.values()):
+            raise ValueError('SSA parameters cannot be used with --adversarial-image')
     pairing = configure_visual_args(args)
     output = Path(args.output).resolve()
     if output.exists() and any(output.iterdir()):
@@ -194,7 +211,7 @@ def prepare(args):
         adversarial, attack_metadata = generate_attack(
             source, target, output / 'attack', root=args.dual_rag_root,
             optimization_config=args.optimization_config, method=args.method, steps=args.steps,
-            epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options)
+            epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options, **spectrum_options)
     clean, poisoned, audit = build_banks(memory_path, args.memory_id, source, adversarial,
                                         output, args.source_asin, args.epsilon_levels, pairing=pairing)
     encoder = encoder_from_args(args)
@@ -219,6 +236,9 @@ def prepare(args):
     if getattr(args, 'method', 'legacy_pixel') == 'frequency_momentum' and not args.adversarial_image:
         manifest['frequency_settings'] = frequency_settings(args.optimization_config,
             root=args.dual_rag_root, **frequency_options)
+    if getattr(args, 'method', 'legacy_pixel') == 'ssa' and not args.adversarial_image:
+        manifest['ssa_settings'] = ssa_settings(args.optimization_config,
+            root=args.dual_rag_root, **spectrum_options)
     dump_json(output / 'manifest.json', manifest)
     print(json.dumps({'output': str(output), 'similarity': similarity,
                       'new_source_recall': ranking['new_source_recall']}, ensure_ascii=False, indent=2))
@@ -378,11 +398,19 @@ def main():
         prepare_parser.add_argument('--' + name, required=True)
     for name in ('source-asin', 'target-asin', 'source-image', 'query-image', 'adversarial-image'):
         prepare_parser.add_argument('--' + name)
-    prepare_parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum'], default='legacy_pixel')
+    prepare_parser.add_argument('--method', choices=['legacy_pixel', 'fair_pixel', 'frequency', 'frequency_momentum', 'ssa'], default='legacy_pixel')
     prepare_parser.add_argument('--frequency-axis-ratio', type=float,
         help='frequency_momentum only: per-axis DCT bandwidth ratio in (0, 1]; defaults to optimization config')
     prepare_parser.add_argument('--frequency-momentum', type=float,
         help='frequency_momentum only: gradient momentum in [0, 1]; defaults to 1.0')
+    prepare_parser.add_argument('--ssa-samples', type=int,
+        help='ssa only: spectrum simulations per step; defaults to optimization config or 20')
+    prepare_parser.add_argument('--ssa-rho', type=float,
+        help='ssa only: multiplicative spectrum mask range; defaults to optimization config or 0.5')
+    prepare_parser.add_argument('--ssa-sigma', type=float,
+        help='ssa only: Gaussian noise standard deviation in 8-bit pixel levels; default 16')
+    prepare_parser.add_argument('--ssa-momentum', type=float,
+        help='ssa only: gradient momentum in [0, 1]; defaults to optimization config or 1.0')
     prepare_parser.add_argument('--steps', type=int, default=1000)
     prepare_parser.add_argument('--epsilon-levels', type=int, default=16)
     prepare_parser.add_argument('--top-k', type=int, default=1)
