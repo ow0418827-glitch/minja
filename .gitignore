@@ -170,6 +170,9 @@ src/configs/llm.local.json
 src/output/
 src/data/OpenAI_api_key.txt
 
+# Independent diffusion runtime, models, and temporary artifacts
+/tmp/
+
 # Machine-specific editor settings and local credentials
 .vscode/
 .env.*

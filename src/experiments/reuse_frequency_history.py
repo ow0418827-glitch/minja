@@ -28,13 +28,17 @@ def _validate_options(args):
                 'test_mode': 'targeted', 'query_specificity': 'vague',
                 'retrieval_encoder': 'clip', 'memory_top_k': 1, 'memory_mode': 'full',
                 'memory_key_mode': 'joint',
-                'memory_query_mode': 'joint', 'index_text': 'full',
+                'memory_query_mode': 'joint',
                 'query_image_mode': 'reference', 'policy_query_image': True,
                 'include_controls': True, 'reserve_tests': 0}
     for key, value in expected.items():
         if getattr(args, key, None) != value:
             raise ValueError('History reuse requires the original evaluation setting: ' + key)
-    if (getattr(args, 'method', None) not in ('frequency_momentum', 'ssa')
+    from src.experiments.visual_memory_experiment import retrieval_options
+    retrieval_options(args)
+    precomputed = (getattr(args, 'method', None) == 'scar' and getattr(args, 'attack_steps', None) == 0
+                   and isinstance(getattr(args, 'precomputed_manifest', None), dict))
+    if not precomputed and (getattr(args, 'method', None) not in ('frequency_momentum', 'ssa')
             or getattr(args, 'attack_steps', 0) < 1):
         raise ValueError('History reuse requires a positive frequency_momentum or ssa attack budget')
     if getattr(args, 'reference_overrides', None):
@@ -56,7 +60,7 @@ def _relocate(value, source, destination):
     return value
 
 
-def _source_evaluation(source, group):
+def _source_evaluation(source, group, *, override=None):
     matches = []
     required = {'test_mode': 'targeted', 'query_specificity': 'vague',
                 'retrieval_encoder': 'clip', 'memory_top_k': 1, 'memory_mode': 'full',
@@ -76,6 +80,13 @@ def _source_evaluation(source, group):
         if (tasks.get('fixed_asin') == group['b'] and tasks.get('test_count') == 20
                 and len(tasks.get('trials', [])) == 20):
             matches.append(path.parent)
+    if override is not None:
+        selected = Path(override)
+        evaluation_root = (source / 'groups' / group['id'] / 'evaluations').resolve()
+        if (not selected.is_absolute() or not selected.resolve().is_relative_to(evaluation_root)
+                or selected.resolve() not in {path.resolve() for path in matches}):
+            raise ValueError('Source evaluation override must select a compliant variant inside the source group evaluations')
+        return selected.resolve()
     if len(matches) != 1:
         raise ValueError('Expected exactly one original vague top-one twenty-demand evaluation: ' + group['id'])
     return matches[0]
@@ -171,7 +182,13 @@ def prepare_reused_history(source_root, args):
     source_args = copy.copy(args)
     source_args.root = source
     _, original_plan, original_groups = driver.load_plan(source_args)
-    evaluations = {group['id']: _source_evaluation(source, group) for group in original_groups}
+    overrides = getattr(args, 'source_evaluation_overrides', {})
+    if (not isinstance(overrides, dict)
+            or set(overrides) - {group['id'] for group in original_groups}
+            or any(not isinstance(value, (str, Path)) for value in overrides.values())):
+        raise ValueError('Source evaluation overrides must be a mapping for the selected source groups')
+    evaluations = {group['id']: _source_evaluation(source, group, override=overrides.get(group['id']))
+                   for group in original_groups}
     original_bindings = {}
     original_ready = {}
     for group in original_groups:
@@ -190,6 +207,9 @@ def prepare_reused_history(source_root, args):
                 'new_plan_sha256': fingerprint(plan), 'new_execution_settings_sha256': fingerprint(settings),
                 'same_twenty_demand_fields': list(DEMAND_FIELDS),
                 'remote_model_calls_during_preparation': 0}
+    if overrides:
+        expected['source_evaluation_overrides'] = {group_id: str(evaluations[group_id])
+                                                   for group_id in sorted(overrides)}
     provenance_path = destination / PROVENANCE_FILE
     if destination.exists():
         if not provenance_path.is_file():
@@ -248,18 +268,24 @@ def prepare_reused_history(source_root, args):
     return provenance
 
 
-def verify_reused_artifacts(args, provenance, require_banks=True):
+def verify_reused_artifacts(args, provenance, require_banks=True, *, evaluation_only=False):
     """Verify immutable source/history and, after finalization, one-image substitution."""
     _validate_options(args)
     _verify_seal(provenance)
     _verify_source_files(provenance)
     source = Path(provenance['source_root']).resolve()
     root, plan, groups = driver.load_plan(args)
+    settings_sha = (fingerprint(read(root / 'run_settings.json')) if evaluation_only
+                    else fingerprint(driver.execution_settings(args, plan)))
     if (str(root) != provenance['destination_root']
             or [group['id'] for group in groups] != provenance['selected_groups']
             or fingerprint(plan) != provenance['new_plan_sha256']
-            or fingerprint(driver.execution_settings(args, plan)) != provenance['new_execution_settings_sha256']):
+            or settings_sha != provenance['new_execution_settings_sha256']):
         raise ValueError('Reused experiment plan or settings changed')
+    if evaluation_only:
+        # Retain the sealed preparation settings. The dedicated evaluation audit
+        # permits only evaluation code/presentation changes and checks all banks.
+        driver.verify_frozen_history_for_evaluation(args, root, plan, groups)
     saved = {item['group']: item for item in provenance['groups']}
     audits = []
     for group in groups:
@@ -287,11 +313,14 @@ def verify_reused_artifacts(args, provenance, require_banks=True):
                     or ready['history_binding_sha256'] != resolved['history_binding_sha256']
                     or driver.digest(attack['image']) != attack['sha256']
                     or attack['sha256'] != ready['attack_sha256']
-                    or optimization.get('steps_requested') != args.attack_steps
-                    or optimization.get('steps_completed') != args.attack_steps
                     or not isinstance(optimization.get('best_step'), int)
-                    or not 0 <= optimization['best_step'] <= args.attack_steps):
+                    or not 0 <= optimization['best_step'] <= optimization.get('steps_completed', -1)):
                 raise ValueError('Frequency attack metadata, image or history binding changed')
+            from src.vision.attack_completion import validate_attack_completion
+            try:
+                validate_attack_completion(attack.get('metadata', {}), args.attack_steps, attack['settings'])
+            except ValueError as error:
+                raise ValueError('Frequency attack metadata is incomplete or invalid: ' + str(error)) from error
             pixels = pixel_audit(resolved['source_image'], attack['image'], args.epsilon_levels)
             pixels['within_budget'] = pixels['max_pixel_difference'] <= args.epsilon_levels
             if driver.digest(folder / 'clean_memory.json') != driver.digest(old_folder / 'clean_memory.json'):

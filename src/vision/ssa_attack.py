@@ -24,7 +24,8 @@ UPSTREAM_COMMIT = "c955cf07c8372bfc4e9f17e647042e027f9f3b1d"
 
 
 def ssa_settings(optimization_config=None, ssa_samples=None, ssa_rho=None,
-                 ssa_sigma=None, ssa_momentum=None, root=DEFAULT_DUAL_ROOT):
+                 ssa_sigma=None, ssa_momentum=None, root=DEFAULT_DUAL_ROOT,
+                 ssa_options=None):
     """解析独立默认值和可选 ssa 配置，不导入模型或张量运行时。"""
     path = Path(optimization_config) if optimization_config else Path(root) / "configs/optimization.json"
     raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -48,9 +49,92 @@ def ssa_settings(optimization_config=None, ssa_samples=None, ssa_rho=None,
         raise ValueError("ssa_sigma 必须为有限非负数，单位为八位灰度级")
     if not math.isfinite(momentum) or not 0 <= momentum <= 1:
         raise ValueError("ssa_momentum 必须为 [0, 1] 内的有限数值")
+    controls = {"early_stop": False, "min_steps": 200, "check_every": 50,
+        "window": 50, "patience": 2, "min_delta": 0.002, "refine_start": 0.6,
+        "step_scale_end": 1.0, "momentum_end": momentum, "rho_end": rho,
+        "sigma_end": sigma, "clean_gradient_weight": 0.0, "mse_weight": 0.0,
+        "selection_tolerance": 0.0}
+    if ssa_options is not None and not isinstance(ssa_options, dict):
+        raise ValueError("ssa_options 必须为对象")
+    supplied = ssa_options or {}
+    unknown = set(supplied) - controls.keys()
+    if unknown:
+        raise ValueError(f"未知 SSA 控制参数：{sorted(unknown)}")
+    controls.update({key: configured[key] for key in controls if key in configured})
+    controls.update(supplied)
+    if not isinstance(controls["early_stop"], bool):
+        raise ValueError("early_stop 必须为布尔值")
+    for key in ("min_steps", "check_every", "window", "patience"):
+        value = controls[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} 必须为正整数")
+    if controls["check_every"] != controls["window"]:
+        raise ValueError("check_every 必须等于 window，确保连续窗口互不重叠")
+    for key in ("min_delta", "refine_start", "step_scale_end", "momentum_end",
+                "rho_end", "sigma_end", "clean_gradient_weight", "mse_weight",
+                "selection_tolerance"):
+        value = controls[key]
+        if isinstance(value, bool):
+            raise ValueError(f"{key} 不能为布尔值")
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{key} 必须为有限非负数")
+        if key in ("refine_start", "step_scale_end", "momentum_end", "rho_end",
+                   "clean_gradient_weight") and value > 1:
+            raise ValueError(f"{key} 必须位于 [0, 1]")
+        if key == "step_scale_end" and value == 0:
+            raise ValueError("step_scale_end 必须大于零")
+        if key == "min_delta" and value == 0:
+            raise ValueError("min_delta 必须大于零")
+        controls[key] = value
     return {"ssa_samples": samples, "ssa_rho": rho, "ssa_sigma": sigma,
-            "ssa_momentum": momentum,
+            "ssa_momentum": momentum, **{f"ssa_{key}": value for key, value in controls.items()},
             "ssa_implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+
+
+class PlateauStopper:
+    """固定候选评分的历史最佳累计收益；不因微小创新高清空耐心。"""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.best_scores = []
+        self.low_gain_windows = 0
+        self.checks = []
+
+    def observe(self, completed_steps, best_score):
+        if completed_steps != len(self.best_scores):
+            raise ValueError("早停观察必须从零开始逐步记录")
+        if not math.isfinite(best_score):
+            raise ValueError("早停评分必须有限")
+        if self.best_scores and best_score < self.best_scores[-1]:
+            raise ValueError("早停必须使用非递减的历史最佳评分")
+        self.best_scores.append(best_score)
+        options = self.settings
+        window = options["ssa_window"]
+        if (not options["ssa_early_stop"] or completed_steps < options["ssa_min_steps"]
+                or completed_steps < window or completed_steps % options["ssa_check_every"]):
+            return False
+        baseline = self.best_scores[completed_steps - window]
+        improvement = best_score - baseline
+        self.low_gain_windows = self.low_gain_windows + 1 if improvement < options["ssa_min_delta"] else 0
+        stopped = self.low_gain_windows >= options["ssa_patience"]
+        self.checks.append({"completed_steps": completed_steps, "best_score": best_score,
+            "baseline_best_score": baseline, "improvement": improvement,
+            "low_gain_windows": self.low_gain_windows, "triggered": stopped})
+        return stopped
+
+
+def refinement_schedule(settings, completed_steps, requested_steps):
+    """后期按已完成步数线性调度；默认所有端值相同，数值路径不变。"""
+    progress = completed_steps / max(1, requested_steps - 1)
+    start = settings["ssa_refine_start"]
+    fraction = 0.0 if start == 1 else max(0.0, min(1.0, (progress - start) / (1 - start)))
+    pairs = {"step_scale": (1.0, settings["ssa_step_scale_end"]),
+        "momentum": (settings["ssa_momentum"], settings["ssa_momentum_end"]),
+        "rho": (settings["ssa_rho"], settings["ssa_rho_end"]),
+        "sigma": (settings["ssa_sigma"], settings["ssa_sigma_end"])}
+    return {key: first if first == last else first + (last - first) * fraction
+            for key, (first, last) in pairs.items()}
 
 
 def _dct_1d(image):
@@ -107,10 +191,12 @@ def quantize_image(image):
 def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
                     optimization_config=None, method=METHOD, steps=1000,
                     epsilon_levels=16, device=None, ssa_samples=None,
-                    ssa_rho=None, ssa_sigma=None, ssa_momentum=None):
+                    ssa_rho=None, ssa_sigma=None, ssa_momentum=None, ssa_options=None,
+                    initial_image=None):
     from src.vision import dual_rag_bridge
     if method != METHOD:
-        if any(value is not None for value in (ssa_samples, ssa_rho, ssa_sigma, ssa_momentum)):
+        if any(value is not None for value in (ssa_samples, ssa_rho, ssa_sigma, ssa_momentum,
+                                              ssa_options, initial_image)):
             raise ValueError("频谱模拟参数仅可用于 ssa 方法")
         from src.vision.frequency_attack import generate_attack as original
         return original(source, target, output_dir, root=root, optimization_config=optimization_config,
@@ -119,7 +205,8 @@ def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
         raise ValueError("steps 必须为正整数")
     if isinstance(epsilon_levels, bool) or not isinstance(epsilon_levels, int) or not 0 < epsilon_levels <= 255:
         raise ValueError("epsilon_levels 必须为 [1, 255] 内的整数")
-    options = ssa_settings(optimization_config, ssa_samples, ssa_rho, ssa_sigma, ssa_momentum, root)
+    options = ssa_settings(optimization_config, ssa_samples, ssa_rho, ssa_sigma,
+                           ssa_momentum, root, ssa_options)
     root = dual_rag_bridge.activate(root)
     from dual_rag.original_attack import resolve_optimization
     path = Path(optimization_config).resolve() if optimization_config else root / "configs/optimization.json"
@@ -130,7 +217,11 @@ def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
         runtime=replace(config.runtime, allow_downloads=False))
     try:
         return run_ssa_attack(source, target, config, steps=steps, output_directory=output_dir,
-                             **{key: value for key, value in options.items() if key != "ssa_implementation_sha256"})
+            ssa_samples=options["ssa_samples"], ssa_rho=options["ssa_rho"],
+            ssa_sigma=options["ssa_sigma"], ssa_momentum=options["ssa_momentum"],
+            ssa_options={key[4:]: value for key, value in options.items()
+                         if key not in {"ssa_samples", "ssa_rho", "ssa_sigma", "ssa_momentum",
+                                        "ssa_implementation_sha256"}}, initial_image=initial_image)
     finally:
         import gc
         import torch
@@ -141,7 +232,8 @@ def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
 
 def run_ssa_attack(source_image, target_image, config, *, steps,
                    output_directory, ssa_samples=None, ssa_rho=None,
-                   ssa_sigma=None, ssa_momentum=None, surrogates=None):
+                   ssa_sigma=None, ssa_momentum=None, surrogates=None,
+                   ssa_options=None, initial_image=None):
     """完整像素变量的官方模拟梯度，与原三代理目标及严格选优兼容。"""
     import torch
     from dual_rag.optimization.attack_core.objective import (
@@ -153,7 +245,8 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
     config.validate()
     options = ssa_settings(optimization_config=getattr(config, "config_path", None),
                            ssa_samples=ssa_samples, ssa_rho=ssa_rho,
-                           ssa_sigma=ssa_sigma, ssa_momentum=ssa_momentum)
+                           ssa_sigma=ssa_sigma, ssa_momentum=ssa_momentum,
+                           ssa_options=ssa_options)
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError("steps 必须为正整数")
     output = Path(output_directory).resolve()
@@ -182,12 +275,30 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
     uniform_weights = source.new_full((3,), 1 / 3)
     model_weights = uniform_weights.clone()
     pixels = source.detach().clone()
-    momentum = torch.zeros_like(pixels)
     minimum, maximum = (source - attack.epsilon).clamp(0, 1), (source + attack.epsilon).clamp(0, 1)
+    initialization = None
+    if initial_image is not None:
+        initial_pil = load_image(initial_image)
+        initial_audit = decoded_image_audit(source_pil, initial_pil,
+            maximum_levels=config.acceptance.decoded_max_pixel_difference)
+        if not initial_audit["within_budget"]:
+            raise ValueError("初始候选图相对原甲图超过扰动预算")
+        pixels = pil_to_tensor(initial_pil, device)
+        if bool((pixels < minimum - 1e-7).any()) or bool((pixels > maximum + 1e-7).any()):
+            raise ValueError("初始候选图相对原甲图超过浮点扰动预算")
+        initialization = {"image_sha256": sha256_file(initial_image)
+            if not hasattr(initial_image, "convert") else None,
+            "image_path": str(Path(initial_image).resolve()) if not hasattr(initial_image, "convert") else None,
+            "budget_reference": "original_source_image", "decoded_pixel_audit": initial_audit}
+    momentum = torch.zeros_like(pixels)
     best_score, best_step = -math.inf, 0
     best_pixels = pixels.clone()
     history, zero_gradient_steps = [], 0
     use_cached_centers = bool(targets.cluster_centers)
+    stopper = PlateauStopper(options)
+    steps_completed, stop_reason = 0, "requested_steps_completed"
+    # 容忍度开启时仅保存未被支配的八位候选到主机，避免显卡驻留全部历史。
+    selection_frontier = []
 
     def fixed_record(objective):
         record = objective.detached_record()
@@ -201,9 +312,24 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
 
     def consider(record, step):
         nonlocal best_score, best_step, best_pixels
-        if record["selection_score"] > best_score:
-            best_score, best_step = record["selection_score"], step
+        score = record["selection_score"]
+        if score > best_score:
+            best_score, best_step = score, step
             best_pixels = pixels.detach().clone()
+        tolerance = options["ssa_selection_tolerance"]
+        if tolerance > 0:
+            threshold = best_score - tolerance
+            selection_frontier[:] = [item for item in selection_frontier if item["score"] >= threshold]
+            if score < threshold:
+                return
+            rounded = quantize_image(pixels).detach()
+            mse = float((rounded - source).square().mean().cpu())
+            if any(item["score"] >= score and item["mse"] <= mse for item in selection_frontier):
+                return
+            selection_frontier[:] = [item for item in selection_frontier
+                if not (score >= item["score"] and mse <= item["mse"])]
+            selection_frontier.append({"score": score, "mse": mse, "step": step,
+                "pixels": rounded.mul(255).round().to(device="cpu", dtype=torch.uint8)})
 
     def score_pixels():
         return evaluate_objective(quantize_image(pixels), surrogates, targets,
@@ -213,16 +339,32 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
         torch.cuda.synchronize(device)
     loop_started = time.perf_counter()
     before = None
+    if initial_image is not None:
+        before = fixed_record(evaluate_objective(source, surrogates, targets,
+            uniform_weights, attack, use_cached_target_centers=use_cached_centers))
+    initial_record = None
+    final_record = None
     for step in range(1, steps + 1):
         original_objective = score_pixels()
         record = fixed_record(original_objective)
         if before is None:
             before = record
+        if initial_record is None:
+            initial_record = record
         consider(record, step - 1)
+        # 此处已完整评分第 step-1 次更新后的图，停止可省去下一整轮频谱采样。
+        if stopper.observe(step - 1, best_score):
+            stop_reason = "early_stop_plateau"
+            final_record = record
+            history.append({"step": step - 1, "scored_state_step": step - 1,
+                **record, "early_stop": True, "linf_after_update": float((pixels - source).abs().max().cpu()),
+                "weights_for_next_step": model_weights.cpu().tolist()})
+            break
+        scheduled = refinement_schedule(options, step - 1, steps)
         accumulated = torch.zeros_like(pixels)
         transformed_objective = None
         for _ in range(options["ssa_samples"]):
-            simulated = spectrum_simulation(pixels, rho=options["ssa_rho"], sigma=options["ssa_sigma"])
+            simulated = spectrum_simulation(pixels, rho=scheduled["rho"], sigma=scheduled["sigma"])
             image_leaf = simulated.requires_grad_(True)
             gradient, objective = sequential_image_gradient(
                 image_leaf, surrogates, targets, model_weights, attack)
@@ -233,6 +375,15 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
             transformed_objective = values if transformed_objective is None else transformed_objective + values
             del simulated, image_leaf, gradient, objective
         gradient = accumulated.div_(options["ssa_samples"])
+        clean_weight = options["ssa_clean_gradient_weight"]
+        if clean_weight > 0:
+            clean_gradient, _ = sequential_image_gradient(
+                pixels.detach().requires_grad_(True), surrogates, targets, model_weights, attack)
+            gradient = (1 - clean_weight) * gradient + clean_weight * clean_gradient
+            del clean_gradient
+        if options["ssa_mse_weight"] > 0:
+            # 平均平方差按预算归一化，系数跨分辨率/预算具有明确尺度。
+            gradient = gradient - (2 * options["ssa_mse_weight"] / (attack.epsilon ** 2 * pixels.numel())) * (pixels - source)
         if not torch.isfinite(gradient).all():
             raise FloatingPointError("频谱模拟梯度包含非有限值")
         if not torch.isfinite(transformed_objective).all():
@@ -240,21 +391,31 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
         zero_gradient_steps += int(not bool(gradient.abs().max()))
         normalized = gradient / gradient.abs().mean(dim=(1, 2, 3), keepdim=True).clamp_min(
             torch.finfo(gradient.dtype).tiny)
-        momentum = (options["ssa_momentum"] * momentum + normalized).detach()
-        proposed = pixels + attack.spatial_step_size * momentum.sign()
+        momentum = (scheduled["momentum"] * momentum + normalized).detach()
+        proposed = pixels + (attack.spatial_step_size * scheduled["step_scale"]) * momentum.sign()
         pixels = torch.maximum(torch.minimum(proposed, maximum), minimum).detach()
+        steps_completed = step
         model_weights = torch.softmax(-original_objective.global_similarities.detach(), dim=0)
         if step == 1 or step == steps or step % attack.log_every == 0:
             history.append({"step": step, "scored_state_step": step - 1, **record,
                 "simulated_mean_objective_terms": (transformed_objective / options["ssa_samples"]).cpu().tolist(),
                 "linf_after_update": float((pixels - source).abs().max().cpu()),
+                "scheduled_parameters": scheduled,
                 "weights_for_next_step": model_weights.cpu().tolist()})
 
-    final_record = fixed_record(score_pixels())
-    consider(final_record, steps)
+    if final_record is None:
+        final_record = fixed_record(score_pixels())
+        consider(final_record, steps_completed)
+        # 最后一步也记录观察值，但已到上限时停止原因仍为完成请求步数。
+        stopper.observe(steps_completed, best_score)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     loop_seconds = time.perf_counter() - loop_started
+    selected_step = best_step
+    if selection_frontier:
+        selected = min(selection_frontier, key=lambda item: (item["mse"], -item["score"], item["step"]))
+        best_pixels = selected["pixels"].to(device=device, dtype=source.dtype).div(255)
+        selected_step = selected["step"]
     image_path = save_tensor_png(output / "adversarial.png", quantize_image(best_pixels))
     decoded = pil_to_tensor(load_image(image_path), device)
     audit = decoded_image_audit(source_pil, image_path,
@@ -269,12 +430,14 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
         "source_image_sha256": sha256_file(source_image) if not hasattr(source_image, "convert") else None,
         "target_image_sha256": sha256_file(target_image) if not hasattr(target_image, "convert") else None,
         "implementation_sha256": options["ssa_implementation_sha256"],
-        "attack": {**asdict(attack), "steps_requested": steps, "steps_completed": steps,
-            "best_step": best_step, "zero_gradient_steps": zero_gradient_steps,
-            "stop_reason": "requested_steps_completed",
+        "attack": {**asdict(attack), "steps_requested": steps, "steps_completed": steps_completed,
+            "best_step": best_step, "selected_step": selected_step,
+            "best_selection_score": best_score, "zero_gradient_steps": zero_gradient_steps,
+            "stop_reason": stop_reason,
             "gradient_execution": "sequential_surrogate_gradient_of_detached_simulated_image",
-            "initialization": "zero"},
+            "initialization": "provided_image" if initialization else "zero"},
         "before_attack": before, "after_attack_saved": saved_record,
+        "initial_candidate": initial_record, "initialization_provenance": initialization,
         "last_step_saved_score": final_record,
         "ssa": {"settings": options, "upstream_url": UPSTREAM_URL,
             "upstream_commit": UPSTREAM_COMMIT,
@@ -288,7 +451,11 @@ def run_ssa_attack(source_image, target_image, config, *, steps,
             "gradient_averaging": "mean_of_simulated_input_gradients",
             "momentum_is_project_extension": True,
             "upstream_momentum_enabled_in_default_script": False,
-            "candidate_selection": "fixed_equal_weight_global_plus_original_local",
+            "candidate_selection": "minimum_decoded_mse_within_fixed_score_tolerance"
+                if options["ssa_selection_tolerance"] > 0 else "fixed_equal_weight_global_plus_original_local",
+            "early_stop_checks": stopper.checks,
+            "early_stop_score": "historical_maximum_of_fixed_equal_weight_8bit_candidates",
+            "mse_penalty": "mean_square_difference_normalized_by_original_source_budget",
             "candidate_scoring": "round_8bit_before_evaluation",
             "projection": "source_plus_minus_epsilon_intersect_0_1",
             "saved_image_claimed_strictly_bandlimited": False},

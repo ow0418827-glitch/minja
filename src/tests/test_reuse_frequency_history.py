@@ -207,6 +207,49 @@ def test_ambiguous_source_evaluation_is_rejected(reusable):
     assert not reusable.new_args.root.exists()
 
 
+def test_explicit_compliant_source_evaluation_resolves_ambiguity_and_is_frozen(reusable):
+    other = reusable.evaluation.with_name('another_top_one')
+    shutil.copytree(reusable.evaluation, other)
+    before = {path: path.read_bytes() for path in reusable.root.rglob('*') if path.is_file()}
+    reusable.new_args.source_evaluation_overrides = {'07_shampoo': str(reusable.evaluation.resolve())}
+    provenance = prepare_reused_history(reusable.root, reusable.new_args)
+    assert provenance['source_evaluation_overrides'] == {'07_shampoo': str(reusable.evaluation.resolve())}
+    assert provenance['groups'][0]['source_evaluation'] == str(reusable.evaluation.resolve())
+    assert 'groups/07_shampoo/evaluations/old_top_one/targeted_tasks.json' in provenance['source_files_sha256']
+    assert all(path.read_bytes() == previous for path, previous in before.items())
+    assert prepare_reused_history(reusable.root, reusable.new_args) == provenance
+    reusable.new_args.source_evaluation_overrides = {'07_shampoo': str(other.resolve())}
+    with pytest.raises(ValueError, match='source, selected groups or frozen settings changed'):
+        prepare_reused_history(reusable.root, reusable.new_args)
+
+
+@pytest.mark.parametrize('invalid', ['relative', 'outside_group', 'noncompliant', 'unknown_group', 'wrong_type', 'wrong_value'])
+def test_source_evaluation_override_rejects_unsafe_or_noncompliant_selection_before_copy(reusable, invalid):
+    selected = reusable.evaluation.resolve()
+    if invalid == 'relative':
+        selected = Path('evaluations/old_top_one')
+    elif invalid == 'outside_group':
+        selected = reusable.root / 'groups/other_group/evaluations/copied_variant'
+        shutil.copytree(reusable.evaluation, selected)
+    elif invalid == 'noncompliant':
+        selected = reusable.evaluation.with_name('wrong_encoder')
+        shutil.copytree(reusable.evaluation, selected)
+        settings = read(selected / 'evaluation_settings.json')
+        settings['protocol']['retrieval_encoder'] = 'gme'
+        write(selected / 'evaluation_settings.json', settings)
+    if invalid == 'unknown_group':
+        reusable.new_args.source_evaluation_overrides = {'01_camera': str(selected)}
+    elif invalid == 'wrong_type':
+        reusable.new_args.source_evaluation_overrides = [str(selected)]
+    elif invalid == 'wrong_value':
+        reusable.new_args.source_evaluation_overrides = {'07_shampoo': None}
+    else:
+        reusable.new_args.source_evaluation_overrides = {'07_shampoo': str(selected)}
+    with pytest.raises(ValueError, match='override'):
+        prepare_reused_history(reusable.root, reusable.new_args)
+    assert not reusable.new_args.root.exists()
+
+
 def test_saved_frequency_steps_must_be_complete(reusable):
     provenance = prepare_reused_history(reusable.root, reusable.new_args)
     folder = materialize_frequency(reusable)

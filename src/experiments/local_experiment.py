@@ -62,7 +62,7 @@ def normal_memory_target(run, state, config):
 
 
 def context(args):
-    from src.experiments.visual_memory_experiment import ssa_options
+    from src.experiments.visual_memory_experiment import ssa_options, retrieval_options
     spectrum_options = ssa_options(args)
     conditions = experiment_conditions(args)
     if getattr(args, 'text_baseline_only', False) and getattr(args, 'stage', None) != 'evaluate':
@@ -100,6 +100,12 @@ def context(args):
     if method == 'ssa':
         from src.vision.ssa_attack import ssa_settings
         settings.update(ssa_settings(**spectrum_options))
+    retrieval = retrieval_options(args)
+    if retrieval:
+        settings['retrieval_options'] = retrieval
+    key_mode, query_mode = getattr(args, 'key_mode', 'image'), getattr(args, 'query_mode', 'image')
+    if key_mode != 'image' or query_mode != 'image':
+        settings['retrieval_modes'] = {'key_mode': key_mode, 'query_mode': query_mode}
     if getattr(args, 'stage', None) == 'evaluate':
         source_name = args.source_run
         if not source_name or Path(source_name).name != source_name or source_name in ('.', '..'):
@@ -112,8 +118,16 @@ def context(args):
         if source_settings['bundle_id'] != tasks['bundle_id']:
             raise ValueError('Source memories belong to a different data bundle')
         manifest = read(source / 'visual/manifest.json')
-        if manifest['attack']['attack']['steps_completed'] != args.attack_steps:
-            raise ValueError('Requested attack steps do not match the frozen source attack')
+        from src.vision.attack_completion import validate_attack_completion
+        try:
+            validate_attack_completion(manifest['attack'], args.attack_steps,
+                                       settings if method == 'ssa' else None)
+        except ValueError as error:
+            raise ValueError('Requested attack steps do not match the frozen source attack: ' + str(error)) from error
+        if manifest.get('retrieval_options', {}) != retrieval:
+            raise ValueError('Requested retrieval settings do not match the frozen source experiment')
+        if manifest.get('key_mode', 'image') != key_mode or manifest.get('query_mode', 'image') != query_mode:
+            raise ValueError('Requested retrieval modes do not match the frozen source experiment')
         source_method = source_settings.get('attack_method', 'legacy_pixel')
         if method != source_method:
             raise ValueError('Requested attack method does not match the frozen source attack')
@@ -363,8 +377,17 @@ def run_all(args):
         attack_options += ['--frequency-momentum', str(args.frequency_momentum)]
     for name, value in spectrum_options.items():
         if value is not None:
-            attack_options += ['--' + name.replace('_', '-'), str(value)]
-    shared += attack_options
+            attack_options += ['--' + name.replace('_', '-'),
+                               json.dumps(value, sort_keys=True) if isinstance(value, dict) else str(value)]
+    from src.experiments.visual_memory_experiment import retrieval_options
+    retrieval = retrieval_options(args)
+    retrieval_flags = [item for name, value in retrieval.items()
+                       for item in ('--' + name.replace('_', '-'), str(value))]
+    for name in ('key_mode', 'query_mode'):
+        mode = getattr(args, name, 'image')
+        if mode != 'image':
+            retrieval_flags += ['--' + name.replace('_', '-'), mode]
+    shared += attack_options + retrieval_flags
     shared += ['--text-top-k', str(text_top_k(args))]
     if getattr(args, 'include_text_baseline', False):
         shared.append('--include-text-baseline')
@@ -375,7 +398,7 @@ def run_all(args):
             '--memory', str(run / 'memory.json'), '--memory-id', ready['memory_id'],
             '--pairing-config', str(root / 'pairing.json'), '--target-image', str(root / tasks['query_image']),
             '--instruction', tasks['trials'][0]['instruction'], '--steps', str(args.attack_steps),
-            '--device', 'cuda', '--output', str(run / 'visual')] + attack_options, cwd=PROJECT, check=True)
+            '--device', 'cuda', '--output', str(run / 'visual')] + attack_options + retrieval_flags, cwd=PROJECT, check=True)
     subprocess.run(base + ['batch'] + shared, cwd=PROJECT, check=True)
 
 
@@ -400,6 +423,12 @@ def main():
         help='ssa only: Gaussian noise standard deviation in 8-bit pixel levels; default 16')
     parser.add_argument('--ssa-momentum', type=float,
         help='ssa only: gradient momentum in [0, 1]; defaults to optimization config or 1.0')
+    parser.add_argument('--ssa-options', help='SSA early-stop/refinement JSON object or UTF-8 JSON file')
+    parser.add_argument('--index-text', choices=['full', 'instruction', 'semantic'], default='full')
+    parser.add_argument('--key-image-weight', type=float, default=0.5)
+    parser.add_argument('--query-image-weight', type=float, default=0.5)
+    parser.add_argument('--key-mode', choices=['image', 'joint'], default='image')
+    parser.add_argument('--query-mode', choices=['image', 'joint'], default='image')
     parser.add_argument('--source-run', default='m3_1000steps_trial01')
     parser.add_argument('--trials', type=int, choices=range(1, 21), default=20)
     parser.add_argument('--memory-mode', choices=['full', 'fragment'], default='full')

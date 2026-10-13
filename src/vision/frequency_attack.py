@@ -41,10 +41,25 @@ def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
                     optimization_config=None, method="legacy_pixel", steps=1000,
                     epsilon_levels=16, device=None, frequency_axis_ratio=None,
                     frequency_momentum=None, ssa_samples=None, ssa_rho=None,
-                    ssa_sigma=None, ssa_momentum=None):
+                    ssa_sigma=None, ssa_momentum=None, ssa_options=None,
+                    initial_image=None, diffusion_options=None):
     from src.vision import dual_rag_bridge
-    ssa_options = dict(ssa_samples=ssa_samples, ssa_rho=ssa_rho,
-                       ssa_sigma=ssa_sigma, ssa_momentum=ssa_momentum)
+    if method == "diffusion":
+        if any(value is not None for value in (frequency_axis_ratio, frequency_momentum,
+                ssa_samples, ssa_rho, ssa_sigma, ssa_momentum, ssa_options, initial_image)):
+            raise ValueError("扩散方法不能混用像素或频谱模拟参数")
+        from src.vision.diffusion_attack import generate_attack as generate_diffusion_attack
+        return generate_diffusion_attack(source, target, output_dir, root=root,
+            optimization_config=optimization_config, method=method, steps=steps,
+            device=device, diffusion_options=diffusion_options, epsilon_levels=epsilon_levels)
+    if diffusion_options is not None:
+        raise ValueError("扩散参数仅可用于 diffusion 方法")
+    simulation_arguments = dict(ssa_samples=ssa_samples, ssa_rho=ssa_rho,
+                                ssa_sigma=ssa_sigma, ssa_momentum=ssa_momentum)
+    if ssa_options is not None:
+        simulation_arguments["ssa_options"] = ssa_options
+    if initial_image is not None:
+        simulation_arguments["initial_image"] = initial_image
     if method == "ssa":
         if frequency_axis_ratio is not None or frequency_momentum is not None:
             raise ValueError("低频参数仅可用于 frequency_momentum 方法")
@@ -52,8 +67,8 @@ def generate_attack(source, target, output_dir, *, root=DEFAULT_DUAL_ROOT,
         return generate_ssa_attack(
             source, target, output_dir, root=root, optimization_config=optimization_config,
             method=method, steps=steps, epsilon_levels=epsilon_levels, device=device,
-            **ssa_options)
-    if any(value is not None for value in ssa_options.values()):
+            **simulation_arguments)
+    if any(value is not None for value in simulation_arguments.values()):
         raise ValueError("频谱模拟参数仅可用于 ssa 方法")
     if method != METHOD:
         if frequency_axis_ratio is not None or frequency_momentum is not None:

@@ -52,7 +52,8 @@ def test_settings_read_only_ssa_section_and_allow_overrides(ssa, tmp_path):
     assert settings["ssa_momentum"] == 0.7
     overridden = ssa.ssa_settings(path, ssa_samples=2, ssa_rho=0, ssa_sigma=0, ssa_momentum=0)
     assert overridden == {**settings, "ssa_samples": 2, "ssa_rho": 0,
-                           "ssa_sigma": 0, "ssa_momentum": 0}
+                           "ssa_sigma": 0, "ssa_momentum": 0,
+                           "ssa_rho_end": 0, "ssa_sigma_end": 0, "ssa_momentum_end": 0}
 
 
 @pytest.mark.parametrize("option,value", [
@@ -313,3 +314,162 @@ def test_existing_output_is_not_overwritten(ssa, small_config, model_factory, tm
         ssa.run_ssa_attack(source, target, small_config, steps=1,
             output_directory=output, ssa_samples=1, surrogates=model_factory())
     assert sentinel.read_bytes() == b"existing-image"
+
+
+def _early_options(**overrides):
+    return {"early_stop": True, "min_steps": 2, "check_every": 2,
+            "window": 2, "patience": 2, "min_delta": 0.002, **overrides}
+
+
+def test_plateau_counts_windows_despite_tiny_new_bests(ssa):
+    stopper = ssa.PlateauStopper(ssa.ssa_settings(ssa_options=_early_options()))
+    stopped = [stopper.observe(step, 1 + step * .0001) for step in range(5)]
+    assert stopped == [False, False, False, False, True]
+    assert [item["low_gain_windows"] for item in stopper.checks] == [1, 2]
+
+
+def test_cumulative_improvement_keeps_going_and_resets_plateau_counter(ssa):
+    stopper = ssa.PlateauStopper(ssa.ssa_settings(ssa_options=_early_options()))
+    scores = [1, 1.0001, 1.0002, 1.01, 1.02, 1.0201, 1.0202, 1.021, 1.0215]
+    stopped = [stopper.observe(step, score) for step, score in enumerate(scores)]
+    assert stopped[-1] and not any(stopped[:-1])
+    assert [item["low_gain_windows"] for item in stopper.checks] == [1, 0, 1, 2]
+    continuing = ssa.PlateauStopper(ssa.ssa_settings(ssa_options=_early_options()))
+    assert not any(continuing.observe(step, 1 + .0011 * step) for step in range(20))
+
+
+def test_plateau_is_not_checked_before_minimum_steps(ssa):
+    stopper = ssa.PlateauStopper(ssa.ssa_settings(ssa_options=_early_options(min_steps=5)))
+    stopped = [stopper.observe(step, 1.0) for step in range(9)]
+    assert [item["completed_steps"] for item in stopper.checks] == [6, 8]
+    assert stopped[-1] and not any(stopped[:-1])
+
+
+def test_early_stop_saves_best_and_avoids_next_expensive_sample(
+    ssa, torch_runtime, small_config, model_factory, monkeypatch, tmp_path,
+):
+    import numpy as np
+    from PIL import Image
+    from dual_rag.optimization.attack_core import objective
+    from src.vision.attack_completion import validate_attack_completion
+    original_gradient = objective.sequential_image_gradient
+    calls = []
+    def observed(*args):
+        calls.append(1)
+        return original_gradient(*args)
+    monkeypatch.setattr(objective, "sequential_image_gradient", observed)
+    source, target = _images()
+    output, metadata = ssa.run_ssa_attack(source, target, small_config,
+        steps=10, output_directory=tmp_path / "early", ssa_samples=2,
+        ssa_options=_early_options(), surrogates=model_factory(constant=True))
+    assert metadata["attack"]["steps_completed"] == 4
+    assert metadata["attack"]["stop_reason"] == "early_stop_plateau"
+    assert metadata["attack"]["best_step"] == 0
+    assert len(calls) == 4 * 2
+    np.testing.assert_array_equal(np.asarray(Image.open(output)), np.asarray(source))
+    validate_attack_completion(metadata, 10, metadata["ssa"]["settings"])
+
+
+def test_last_allowed_update_remains_normal_completion(ssa, small_config, model_factory, tmp_path):
+    from src.vision.attack_completion import validate_attack_completion
+    source, target = _images()
+    _, metadata = ssa.run_ssa_attack(source, target, small_config,
+        steps=4, output_directory=tmp_path / "last", ssa_samples=1,
+        ssa_options=_early_options(), surrogates=model_factory(constant=True))
+    assert metadata["attack"]["steps_completed"] == 4
+    assert metadata["attack"]["stop_reason"] == "requested_steps_completed"
+    validate_attack_completion(metadata, 4)
+
+
+def test_selection_tolerance_preserves_smallest_decoded_modification(
+    ssa, small_config, model_factory, tmp_path,
+):
+    import numpy as np
+    from PIL import Image
+    source, target = _images()
+    output, metadata = ssa.run_ssa_attack(source, target, small_config,
+        steps=6, output_directory=tmp_path / "tolerance", ssa_samples=1,
+        ssa_rho=0, ssa_sigma=0, ssa_momentum=0,
+        ssa_options={"selection_tolerance": 10}, surrogates=model_factory())
+    assert metadata["attack"]["best_step"] > 0
+    assert metadata["attack"]["selected_step"] == 0
+    assert metadata["attack"]["best_selection_score"] > metadata["after_attack_saved"]["selection_score"]
+    np.testing.assert_array_equal(np.asarray(Image.open(output)), np.asarray(source))
+
+
+def test_refinement_reaches_end_settings_only_after_start(ssa):
+    settings = ssa.ssa_settings(ssa_options={"refine_start": .5,
+        "step_scale_end": .2, "momentum_end": .8, "rho_end": .1, "sigma_end": 4})
+    assert ssa.refinement_schedule(settings, 5, 11) == {
+        "step_scale": 1, "momentum": 1, "rho": .5, "sigma": 16}
+    end = ssa.refinement_schedule(settings, 10, 11)
+    assert end == pytest.approx({"step_scale": .2, "momentum": .8, "rho": .1, "sigma": 4})
+
+
+def test_mse_penalty_limits_modification_for_same_gradient_budget(
+    ssa, torch_runtime, small_config, model_factory, monkeypatch, tmp_path,
+):
+    from dual_rag.optimization.attack_core import objective
+    original_gradient = objective.sequential_image_gradient
+    def observed(image, *args):
+        _, values = original_gradient(image, *args)
+        return torch_runtime.ones_like(image) * 1e-6, values
+    monkeypatch.setattr(objective, "sequential_image_gradient", observed)
+    source, target = _images()
+    results = []
+    for weight in (0, 1):
+        _, metadata = ssa.run_ssa_attack(source, target, small_config,
+            steps=6, output_directory=tmp_path / f"penalty-{weight}", ssa_samples=1,
+            ssa_rho=0, ssa_sigma=0, ssa_momentum=0,
+            ssa_options={"mse_weight": weight}, surrogates=model_factory())
+        results.append(metadata)
+    assert results[1]["decoded_pixel_audit"]["mean_squared_pixel_difference_levels"] < results[0]["decoded_pixel_audit"]["mean_squared_pixel_difference_levels"]
+    assert all(item["decoded_pixel_audit"]["within_budget"] for item in results)
+
+
+def test_clean_gradient_adds_one_gradient_per_update_and_preserves_budget(
+    ssa, torch_runtime, small_config, model_factory, monkeypatch, tmp_path,
+):
+    from dual_rag.optimization.attack_core import objective
+    original_gradient = objective.sequential_image_gradient
+    calls = []
+    def observed(*args):
+        calls.append(1)
+        return original_gradient(*args)
+    monkeypatch.setattr(objective, "sequential_image_gradient", observed)
+    source, target = _images()
+    _, metadata = ssa.run_ssa_attack(source, target, small_config,
+        steps=2, output_directory=tmp_path / "clean", ssa_samples=2,
+        ssa_options={"clean_gradient_weight": .3}, surrogates=model_factory())
+    assert len(calls) == 6
+    assert metadata["decoded_pixel_audit"]["within_budget"]
+
+
+def test_initial_image_keeps_original_source_budget_and_provenance(
+    ssa, small_config, model_factory, tmp_path,
+):
+    from PIL import Image
+    source, target = _images()
+    initial = tmp_path / "initial.png"
+    Image.new("RGB", source.size, (78, 122, 182)).save(initial)
+    _, metadata = ssa.run_ssa_attack(source, target, small_config,
+        steps=2, output_directory=tmp_path / "initial-run", ssa_samples=1,
+        initial_image=initial, surrogates=model_factory())
+    assert metadata["attack"]["initialization"] == "provided_image"
+    assert metadata["initialization_provenance"]["budget_reference"] == "original_source_image"
+    assert len(metadata["initialization_provenance"]["image_sha256"]) == 64
+    assert metadata["decoded_pixel_audit"]["within_budget"]
+    with pytest.raises(ValueError, match="预算"):
+        ssa.run_ssa_attack(source, target, small_config, steps=1,
+            output_directory=tmp_path / "invalid-init", ssa_samples=1,
+            initial_image=target.resize(source.size), surrogates=model_factory())
+
+
+@pytest.mark.parametrize("options", [
+    {"early_stop": 1}, {"min_steps": True}, {"patience": 0}, {"window": 10},
+    {"min_delta": 0}, {"refine_start": 1.1}, {"step_scale_end": 0},
+    {"mse_weight": float("nan")}, {"selection_tolerance": -1}, {"unknown": 1},
+])
+def test_control_settings_reject_invalid_values_before_loading_models(ssa, options):
+    with pytest.raises(ValueError):
+        ssa.ssa_settings(ssa_options=options)

@@ -9,6 +9,10 @@ param(
     [Nullable[double]]$SsaRho = $null,
     [Nullable[double]]$SsaSigma = $null,
     [Nullable[double]]$SsaMomentum = $null,
+    [string]$SsaOptions,
+    [ValidateSet('full','instruction','semantic')][string]$IndexText = 'full',
+    [ValidateRange(0,1)][double]$KeyImageWeight = 0.5,
+    [ValidateRange(0,1)][double]$QueryImageWeight = 0.5,
     [switch]$ModelCheck,
     [switch]$AllowCodeUpdateResume,
     [switch]$AllowBoundHistoryRepairResume
@@ -21,7 +25,7 @@ if ($ModelCheck -and $Stage -ne 'Check') { throw 'ModelCheck requires stage Chec
 if ($Method -ne 'frequency_momentum' -and ($null -ne $FrequencyAxisRatio -or $null -ne $FrequencyMomentum)) {
     throw 'FrequencyAxisRatio and FrequencyMomentum require Method frequency_momentum.'
 }
-if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum)) {
+if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum -or $SsaOptions)) {
     throw 'SsaSamples, SsaRho, SsaSigma and SsaMomentum require Method ssa.'
 }
 if (-not $Root) {
@@ -43,7 +47,7 @@ $parameters = @{
     MemoryQueryMode = 'joint'
     MemoryMode = 'full'
     MemoryTopK = 1
-    IndexText = 'full'
+    IndexText = $IndexText
     TestMode = 'targeted'
     QuerySpecificity = 'vague'
     QueryImageMode = 'reference'
@@ -62,6 +66,9 @@ if ($null -ne $SsaSamples) { $parameters.SsaSamples = $SsaSamples }
 if ($null -ne $SsaRho) { $parameters.SsaRho = $SsaRho }
 if ($null -ne $SsaSigma) { $parameters.SsaSigma = $SsaSigma }
 if ($null -ne $SsaMomentum) { $parameters.SsaMomentum = $SsaMomentum }
+if ($SsaOptions) { $parameters.SsaOptions = $SsaOptions }
+if ($KeyImageWeight -ne 0.5) { $parameters.KeyImageWeight = $KeyImageWeight }
+if ($QueryImageWeight -ne 0.5) { $parameters.QueryImageWeight = $QueryImageWeight }
 if ($ModelCheck) { $parameters.ModelCheck = $true }
 if ($AllowCodeUpdateResume) { $parameters.AllowCodeUpdateResume = $true }
 if ($AllowBoundHistoryRepairResume) { $parameters.AllowBoundHistoryRepairResume = $true }

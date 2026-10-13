@@ -1,0 +1,13 @@
+{
+  "image_size": 256,
+  "strength": 0.5,
+  "guidance_scale": 5.0,
+  "latent_step_clip": 0.15,
+  "source_weight": 1.0,
+  "prompt": "a studio product photo of four white foaming hand wash pump bottles on a white background",
+  "prompt_guidance_scale": 1.0,
+  "seed": 42,
+  "initialization": "ddim_inversion",
+  "normalize_gradient": true,
+  "attention_slicing": true
+}

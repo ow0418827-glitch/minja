@@ -1,0 +1,8 @@
+{
+  "early_stop": true,
+  "min_steps": 200,
+  "check_every": 50,
+  "window": 50,
+  "patience": 2,
+  "min_delta": 0.002
+}

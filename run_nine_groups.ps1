@@ -17,11 +17,13 @@ param(
     [Nullable[double]]$SsaRho = $null,
     [Nullable[double]]$SsaSigma = $null,
     [Nullable[double]]$SsaMomentum = $null,
+    [string]$SsaOptions,
     [ValidateRange(1,255)][int]$EpsilonLevels = 16,
     [string]$OptimizationConfig,
     [string]$ReferenceOverrides,
     [ValidateRange(1,200)][int]$NumSteps = 20,
     [ValidateRange(1,20)][int]$NormalRetries = 2,
+    [ValidateRange(0,5)][int]$HistoryReserveCount = 0,
     [ValidateRange(1,50)][int]$HistoryMaxAttempts = 3,
     [ValidateSet('observed','planned')][string]$HistoryProductMode = 'observed',
     [ValidateSet('attacker','victim')][string]$SourceHistoryMode = 'attacker',
@@ -34,7 +36,9 @@ param(
     [string]$GmeModel = 'Alibaba-NLP/gme-Qwen2-VL-2B-Instruct',
     [ValidateSet('joint','image')][string]$MemoryKeyMode = 'joint',
     [ValidateSet('joint','image')][string]$MemoryQueryMode = 'joint',
-    [ValidateSet('full','instruction')][string]$IndexText = 'full',
+    [ValidateSet('full','instruction','semantic')][string]$IndexText = 'full',
+    [ValidateRange(0,1)][double]$KeyImageWeight = 0.5,
+    [ValidateRange(0,1)][double]$QueryImageWeight = 0.5,
     [ValidateSet('targeted','heldout')][string]$TestMode = 'targeted',
     [ValidateSet('vague','strict')][string]$QuerySpecificity = 'vague',
     [ValidateRange(0,5)][int]$ReserveTests = 5,
@@ -57,7 +61,7 @@ $ErrorActionPreference = 'Stop'
 if ($Method -ne 'frequency_momentum' -and ($null -ne $FrequencyAxisRatio -or $null -ne $FrequencyMomentum)) {
     throw 'FrequencyAxisRatio and FrequencyMomentum require Method frequency_momentum.'
 }
-if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum)) {
+if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum -or $SsaOptions)) {
     throw 'SsaSamples, SsaRho, SsaSigma and SsaMomentum require Method ssa.'
 }
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Python not found: $Python" }
@@ -85,6 +89,7 @@ try {
             '--attack-steps',"$AttackSteps",'--method',$Method,'--epsilon-levels',"$EpsilonLevels",
             '--num-steps',"$NumSteps",'--memory-top-k',"$MemoryTopK",'--memory-mode',$MemoryMode,
             '--normal-retries',"$NormalRetries",'--history-max-attempts',"$HistoryMaxAttempts",
+            '--history-reserve-count',"$HistoryReserveCount",
             '--history-product-mode',$HistoryProductMode,
             '--source-history-mode',$SourceHistoryMode,
             '--memory-prompt-budget',"$MemoryPromptBudget",'--query-image-mode',$QueryImageMode,
@@ -103,6 +108,8 @@ try {
         if ($null -ne $SsaRho) { $experimentArgs += @('--ssa-rho', "$SsaRho") }
         if ($null -ne $SsaSigma) { $experimentArgs += @('--ssa-sigma', "$SsaSigma") }
         if ($null -ne $SsaMomentum) { $experimentArgs += @('--ssa-momentum', "$SsaMomentum") }
+        if ($SsaOptions) { $experimentArgs += @('--ssa-options', $SsaOptions) }
+        $experimentArgs += @('--key-image-weight', "$KeyImageWeight", '--query-image-weight', "$QueryImageWeight")
         if ($IncludeControls) { $experimentArgs += '--include-controls' }
         if ($NoPolicyQueryImage -or -not $PolicyQueryImage) {
             $experimentArgs += '--no-policy-query-image'

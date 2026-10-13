@@ -10,6 +10,12 @@ param(
     [Nullable[double]]$SsaRho = $null,
     [Nullable[double]]$SsaSigma = $null,
     [Nullable[double]]$SsaMomentum = $null,
+    [string]$SsaOptions,
+    [ValidateSet('full','instruction','semantic')][string]$IndexText = 'full',
+    [ValidateRange(0,1)][double]$KeyImageWeight = 0.5,
+    [ValidateRange(0,1)][double]$QueryImageWeight = 0.5,
+    [ValidateSet('image','joint')][string]$KeyMode = 'image',
+    [ValidateSet('image','joint')][string]$QueryMode = 'image',
     [int]$NumSteps = 20,
     [ValidateRange(1,20)][int]$Trials = 20,
     [ValidateSet('full','fragment')][string]$MemoryMode = 'full',
@@ -23,7 +29,7 @@ $ErrorActionPreference = 'Stop'
 if ($Method -ne 'frequency_momentum' -and ($null -ne $FrequencyAxisRatio -or $null -ne $FrequencyMomentum)) {
     throw 'FrequencyAxisRatio and FrequencyMomentum require Method frequency_momentum.'
 }
-if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum)) {
+if ($Method -ne 'ssa' -and ($null -ne $SsaSamples -or $null -ne $SsaRho -or $null -ne $SsaSigma -or $null -ne $SsaMomentum -or $SsaOptions)) {
     throw 'SsaSamples, SsaRho, SsaSigma and SsaMomentum require Method ssa.'
 }
 if ($TextBaselineOnly -and $Stage -ne 'Evaluate') { throw 'TextBaselineOnly requires Stage Evaluate.' }
@@ -46,6 +52,9 @@ if ($null -ne $SsaSamples) { $frequencyArgs += @('--ssa-samples', "$SsaSamples")
 if ($null -ne $SsaRho) { $frequencyArgs += @('--ssa-rho', "$SsaRho") }
 if ($null -ne $SsaSigma) { $frequencyArgs += @('--ssa-sigma', "$SsaSigma") }
 if ($null -ne $SsaMomentum) { $frequencyArgs += @('--ssa-momentum', "$SsaMomentum") }
+if ($SsaOptions) { $frequencyArgs += @('--ssa-options', $SsaOptions) }
+$frequencyArgs += @('--index-text', $IndexText, '--key-image-weight', "$KeyImageWeight", '--query-image-weight', "$QueryImageWeight")
+$frequencyArgs += @('--key-mode', $KeyMode, '--query-mode', $QueryMode)
 if ($IncludeTextBaseline) { $textBaselineArgs += '--include-text-baseline' }
 if ($TextBaselineOnly) { $textBaselineArgs += '--text-baseline-only' }
 if ($Stage -eq 'Serve') {

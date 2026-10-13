@@ -31,18 +31,11 @@ def verify_source_files(provenance):
 def _entry_vector(retriever, bank, entry):
     # Reuse the exact cache scope created by rank, rather than an image-only
     # approximation or a different full-text encoder.
-    identity = {
-        'bank_sha256': sha256(retriever.memory_path),
-        'entries_sha256': canonical_digest(bank),
-        'model_sha256': canonical_digest(retriever.encoder.snapshot),
-        'key_mode': retriever.key_mode,
-        'index_text': retriever.index_text,
-        'index_text_policy_sha256': canonical_digest(retriever.snapshot['index_text_policy']),
-    }
+    identity = retriever.index_identity(bank)
     text = memory_index_text(entry, retriever.index_text)
     path = resolve_image(entry, retriever.memory_path)
     return retriever._encode(text, path, retriever.key_mode,
-                             scope=canonical_digest(identity))[0]
+                             scope=canonical_digest(identity), image_weight=retriever.key_image_weight)[0]
 
 
 def _vector_record(vector):
@@ -59,7 +52,8 @@ def _by_id(bank):
 
 
 def _same_index_content(before, before_path, after, after_path, index_text):
-    return (memory_index_text(before, index_text) == memory_index_text(after, index_text)
+    return (memory_index_text(before, 'full') == memory_index_text(after, 'full')
+            and memory_index_text(before, index_text) == memory_index_text(after, index_text)
             and sha256(resolve_image(before, before_path))
             == sha256(resolve_image(after, after_path)))
 
@@ -68,9 +62,10 @@ def prime_retrieval(args, provenance):
     """Write offline vector/ranking evidence for twenty fixed old-B wordings."""
     if (getattr(args, 'reserve_tests', 0) != 0
             or args.query_specificity != 'vague'
-            or args.memory_key_mode != 'joint' or args.memory_query_mode != 'joint'
-            or args.index_text != 'full'):
-        raise ValueError('Old-B comparison requires twenty vague full-joint queries without reserves')
+            or args.memory_key_mode != 'joint' or args.memory_query_mode != 'joint'):
+        raise ValueError('Old-B comparison requires twenty vague joint queries without reserves')
+    from src.experiments.visual_memory_experiment import retrieval_options
+    fusion = retrieval_options(args)
     verified_count = verify_source_files(provenance)
     root, plan, groups = driver.load_plan(args)
     source_root = Path(provenance['source_root']).resolve()
@@ -113,11 +108,12 @@ def prime_retrieval(args, provenance):
             bank_paths = {'clean': folder / 'clean_memory.json', 'adversarial': folder / 'memory.json'}
             banks = {condition: read(path) for condition, path in bank_paths.items()}
             retrievers = {condition: VisualMemoryRetriever(
-                encoder, path, key_mode='joint', query_mode='joint', index_text='full')
+                encoder, path, key_mode='joint', query_mode='joint',
+                **dict(fusion, index_text=args.index_text))
                 for condition, path in bank_paths.items()}
             old_retriever = VisualMemoryRetriever(
                 encoder, old_pixel_path, key_mode='joint', query_mode='joint',
-                index_text='full', cache_dir=None)
+                cache_dir=None, **dict(fusion, index_text=args.index_text))
             old_ranking = old_retriever.rank(eligible(old_pixel), tasks[0]['instruction'], group['query_image'])
             unchanged = []
             for condition, bank in banks.items():
@@ -128,20 +124,21 @@ def prime_retrieval(args, provenance):
                     if memory_id == source_id:
                         continue
                     if (not _same_index_content(old_clean_ids[memory_id], old_clean_path,
-                                                ids[memory_id], bank_paths[condition], 'full')
+                                                ids[memory_id], bank_paths[condition], args.index_text)
                             or not _same_index_content(old_pixel_ids[memory_id], old_pixel_path,
-                                                      ids[memory_id], bank_paths[condition], 'full')):
+                                                      ids[memory_id], bank_paths[condition], args.index_text)):
                         raise ValueError('A normal memory text or retrieval image changed')
                 if len(ids) - 1 != 14 or source_id not in ids:
                     raise ValueError('Fourteen normal memories and one fixed A memory are required')
                 before = old_clean_ids[source_id]
                 after = ids[source_id]
                 if (memory_index_text(before) != memory_index_text(after)
+                        or memory_index_text(before, args.index_text) != memory_index_text(after, args.index_text)
                         or before.get('PrimaryImage', {}).get('SHA256')
                         != after.get('PrimaryImage', {}).get('SHA256')):
                     raise ValueError('Original A history text or purchased primary image changed')
                 if condition == 'clean' and not _same_index_content(
-                        before, old_clean_path, after, bank_paths[condition], 'full'):
+                        before, old_clean_path, after, bank_paths[condition], args.index_text):
                     raise ValueError('The reused clean A memory changed')
             trial_vectors, condition_rankings = [], {'clean': [], 'adversarial': []}
             for task in tasks:
@@ -151,7 +148,8 @@ def prime_retrieval(args, provenance):
                     ranking = retriever.rank(bank, task['instruction'], group['query_image'])
                     if len(ranking) != 15:
                         raise ValueError('Every index must contain fifteen eligible memories')
-                    vector, key = retriever._encode(task['instruction'], Path(group['query_image']), 'joint')
+                    vector, key = retriever._encode(task['instruction'], Path(group['query_image']), 'joint',
+                                                   image_weight=retriever.query_image_weight)
                     query_vectors[condition] = vector
                     selected = next(row for row in ranking if row['Id'] == source_id)
                     normal = max((row for row in ranking if row['Id'] != source_id),
@@ -189,6 +187,7 @@ def prime_retrieval(args, provenance):
                 unchanged.append(memory_id)
             group_report = {
                 'group': group['id'], 'reference_asin': group['b'], 'query_image_sha256': query_sha,
+                'retrieval_snapshot': retrievers['clean'].snapshot,
                 'source_memory_id': source_id, 'tasks_sha256': tasks_sha, 'test_count': len(tasks),
                 'unchanged_normal_memories': len(unchanged), 'primary_a_image_unchanged': True,
                 'bank_vectors_per_condition': {name: len(banks[name]) for name in banks},

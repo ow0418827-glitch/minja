@@ -1,0 +1,10 @@
+{
+  "refine_start": 0.0,
+  "step_scale_end": 0.2,
+  "momentum_end": 0.8,
+  "rho_end": 0.1,
+  "sigma_end": 4.0,
+  "clean_gradient_weight": 0.5,
+  "mse_weight": 0.01,
+  "selection_tolerance": 0.002
+}

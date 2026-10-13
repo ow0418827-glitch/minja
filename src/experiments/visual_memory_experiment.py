@@ -127,13 +127,30 @@ def build_banks(memory_path, memory_id, source, adversarial, output, source_asin
 
 
 def encoder_from_args(args):
-    return make_encoder(args.dual_rag_root, args.optimization_config, args.surrogate, args.device)
+    base = make_encoder(args.dual_rag_root, args.optimization_config, args.surrogate, args.device)
+    if (getattr(args, 'key_image_weight', 0.5) != 0.5
+            or getattr(args, 'query_image_weight', 0.5) != 0.5
+            or getattr(args, 'index_text', 'full') == 'semantic'):
+        from src.vision.joint_encoder import ChunkedClipEncoder
+        return ChunkedClipEncoder(base)
+    return base
 
 
 def ssa_options(args):
     """Return only the selected method's options; reject unused explicit parameters."""
     options = {name: getattr(args, name, None) for name in
                ('ssa_samples', 'ssa_rho', 'ssa_sigma', 'ssa_momentum')}
+    extended = getattr(args, 'ssa_options', None)
+    if extended is not None:
+        if isinstance(extended, str):
+            try:
+                extended = json.loads(extended) if extended.lstrip().startswith('{') else json.loads(
+                    Path(extended).read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError('--ssa-options must be a JSON object or a readable UTF-8 JSON file') from error
+        if not isinstance(extended, dict):
+            raise ValueError('--ssa-options must contain a JSON object')
+        options['ssa_options'] = dict(extended)
     if getattr(args, 'method', 'legacy_pixel') != 'ssa':
         if any(value is not None for value in options.values()):
             raise ValueError('SSA parameters require --method ssa')
@@ -141,11 +158,33 @@ def ssa_options(args):
     return options
 
 
+def retrieval_options(args, *, index_text='full'):
+    """Preserve legacy defaults while making nondefault fusion reproducible."""
+    import math
+    result = {}
+    for name in ('key_image_weight', 'query_image_weight'):
+        value = getattr(args, name, 0.5)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError('--' + name.replace('_', '-') + ' must be between 0 and 1')
+        side = 'key' if name == 'key_image_weight' else 'query'
+        mode = getattr(args, side + '_mode', getattr(args, 'memory_' + side + '_mode', None))
+        if mode == 'image' and value != 0.5:
+            raise ValueError('Nondefault ' + name + ' requires joint ' + side + ' mode')
+        if value != 0.5:
+            result[name] = float(value)
+    mode = getattr(args, 'index_text', index_text)
+    if mode not in ('full', 'instruction', 'semantic'):
+        raise ValueError('Invalid memory index text mode')
+    if mode != index_text:
+        result['index_text'] = mode
+    return result
+
+
 def paired_ranking(clean, poisoned, output, query_image, instruction, encoder, memory_id,
-                   key_mode='image', query_mode='image', top_k=1):
+                   key_mode='image', query_mode='image', top_k=1, **retrieval):
     results = {}
     for name, entries in [('clean', clean), ('adversarial', poisoned)]:
-        retriever = VisualMemoryRetriever(encoder, Path(output) / f'{name}_memory.json', key_mode, query_mode)
+        retriever = VisualMemoryRetriever(encoder, Path(output) / f'{name}_memory.json', key_mode, query_mode, **retrieval)
         ranking = retriever.rank(eligible(entries), instruction, query_image)
         source = next((item for item in ranking if item['Id'] == memory_id), None)
         results[name] = {'ranking': ranking, 'source_rank': source['rank'] if source else None,
@@ -159,6 +198,7 @@ def paired_ranking(clean, poisoned, output, query_image, instruction, encoder, m
 
 
 def prepare(args):
+    retrieval = retrieval_options(args)
     frequency_options = {}
     spectrum_options = ssa_options(args)
     if getattr(args, 'method', 'legacy_pixel') == 'frequency_momentum':
@@ -212,11 +252,15 @@ def prepare(args):
             source, target, output / 'attack', root=args.dual_rag_root,
             optimization_config=args.optimization_config, method=args.method, steps=args.steps,
             epsilon_levels=args.epsilon_levels, device=args.device, **frequency_options, **spectrum_options)
+        from src.vision.attack_completion import validate_attack_completion
+        expected = (ssa_settings(args.optimization_config, root=args.dual_rag_root, **spectrum_options)
+                    if args.method == 'ssa' else None)
+        validate_attack_completion(attack_metadata, args.steps, expected)
     clean, poisoned, audit = build_banks(memory_path, args.memory_id, source, adversarial,
                                         output, args.source_asin, args.epsilon_levels, pairing=pairing)
     encoder = encoder_from_args(args)
     ranking = paired_ranking(clean, poisoned, output, query, args.instruction, encoder,
-                             args.memory_id, args.key_mode, args.query_mode, args.top_k)
+                             args.memory_id, args.key_mode, args.query_mode, args.top_k, **retrieval)
     # Similarity is measured from the decoded saved file, not a float tensor.
     target_vector = encoder.encode(target)
     similarity = {'source_to_target': float(encoder.encode(source) @ target_vector),
@@ -233,6 +277,8 @@ def prepare(args):
         'top_k': args.top_k, 'pixel_audit': audit, 'similarity': similarity,
         'attack': attack_metadata, 'text_history_frozen': True,
     }
+    if retrieval:
+        manifest['retrieval_options'] = retrieval
     if getattr(args, 'method', 'legacy_pixel') == 'frequency_momentum' and not args.adversarial_image:
         manifest['frequency_settings'] = frequency_settings(args.optimization_config,
             root=args.dual_rag_root, **frequency_options)
@@ -267,8 +313,15 @@ def load_experiment(args):
     if getattr(args, 'text_baseline_only', False):
         return root, manifest, banks, None, None
     query = resolve_image({'PrimaryImage': manifest['query_image']}, root / 'manifest.json')
-    encoder = encoder_from_args(args)
-    if encoder.snapshot != manifest['encoder']:
+    encoder_args = copy.copy(args)
+    for name, value in manifest.get('retrieval_options', {}).items():
+        setattr(encoder_args, name, value)
+    encoder = encoder_from_args(encoder_args)
+    encoder_snapshot = dict(encoder.snapshot)
+    # This describes the optional formula; its legacy 0.5 path is unchanged.
+    if 'weighted_fusion' not in manifest['encoder']:
+        encoder_snapshot.pop('weighted_fusion', None)
+    if encoder_snapshot != manifest['encoder']:
         raise ValueError('Encoder differs from preparation; create a new experiment')
     return root, manifest, banks, query, encoder
 
@@ -277,7 +330,8 @@ def rank(args):
     root, manifest, banks, query, encoder = load_experiment(args)
     result = paired_ranking(banks['clean'], banks['adversarial'], root, query,
                             manifest['instruction'], encoder, manifest['memory_id'],
-                            manifest['key_mode'], manifest['query_mode'], manifest['top_k'])
+                            manifest['key_mode'], manifest['query_mode'], manifest['top_k'],
+                            **manifest.get('retrieval_options', {}))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -316,7 +370,8 @@ def shop(args, runtime=None):
         memory, embeddings = minja.generate_embeddings(entries, text_encoder)
         memory_path = root / f'{bank_name}_memory.json'
         is_text = condition == 'text'
-        retriever = None if is_text else VisualMemoryRetriever(encoder, memory_path, manifest['key_mode'], manifest['query_mode'])
+        retriever = None if is_text else VisualMemoryRetriever(encoder, memory_path, manifest['key_mode'], manifest['query_mode'],
+                                                               **manifest.get('retrieval_options', {}))
         # Identical server session and explicit reset for each paired condition.
         env = minja.webshopEnv({args.session: instruction})
         try:
@@ -411,11 +466,15 @@ def main():
         help='ssa only: Gaussian noise standard deviation in 8-bit pixel levels; default 16')
     prepare_parser.add_argument('--ssa-momentum', type=float,
         help='ssa only: gradient momentum in [0, 1]; defaults to optimization config or 1.0')
+    prepare_parser.add_argument('--ssa-options', help='SSA early-stop/refinement JSON object or UTF-8 JSON file')
     prepare_parser.add_argument('--steps', type=int, default=1000)
     prepare_parser.add_argument('--epsilon-levels', type=int, default=16)
     prepare_parser.add_argument('--top-k', type=int, default=1)
     prepare_parser.add_argument('--key-mode', choices=['image', 'joint'], default='image')
     prepare_parser.add_argument('--query-mode', choices=['image', 'joint'], default='image')
+    prepare_parser.add_argument('--index-text', choices=['full', 'instruction', 'semantic'], default='full')
+    prepare_parser.add_argument('--key-image-weight', type=float, default=0.5)
+    prepare_parser.add_argument('--query-image-weight', type=float, default=0.5)
     rank_parser = commands.add_parser('rank', help='Recompute decoded-image rankings')
     rank_parser.add_argument('--experiment', required=True)
     shop_parser = commands.add_parser('shop', help='Compare three conditions in local WebShop')

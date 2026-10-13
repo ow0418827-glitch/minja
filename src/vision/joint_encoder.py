@@ -31,6 +31,17 @@ def _text_digest(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def validated_image_weight(value):
+    """A fusion coefficient, not a percentage of the final retrieval score."""
+    try:
+        weight = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("image_weight must be a finite number between 0 and 1") from exc
+    if not np.isfinite(weight) or not 0 <= weight <= 1:
+        raise ValueError("image_weight must be a finite number between 0 and 1")
+    return weight
+
+
 def split_token_bounded_text(text, encode_tokens, payload_tokens):
     """Split at character boundaries using real token counts; preserve all text.
 
@@ -59,7 +70,9 @@ def split_token_bounded_text(text, encode_tokens, payload_tokens):
 
 
 class ChunkedClipEncoder:
-    """Equal text/image fusion; length-weighted mean of all text token chunks."""
+    """Weighted unit text/image fusion, with an exact legacy equal-weight path."""
+
+    supports_image_weight = True
 
     def __init__(self, base):
         self.base = base
@@ -77,6 +90,12 @@ class ChunkedClipEncoder:
         self.snapshot = {
             **base.snapshot,
             "fusion": "equal_unit_image_plus_unit_full_text",
+            "weighted_fusion": {
+                "algorithm": "unit_alpha_image_plus_one_minus_alpha_full_text_v1",
+                "default_image_weight": 0.5,
+                "equal_weight_path": "exact_legacy_image_plus_text",
+                "empty_text": "image_only_except_text_only_weight_rejected",
+            },
             "text_policy": {
                 "algorithm": "contiguous_nonoverlapping_raw_token_chunks_v1",
                 "context_length": self.context_length,
@@ -130,14 +149,32 @@ class ChunkedClipEncoder:
         }
         return normalized(weighted / sum(weights))
 
-    def encode_joint(self, text, path):
-        image = self.encode(path)
+    def encode_joint(self, text, path, image_weight=0.5):
+        self._assert_open()
+        weight = validated_image_weight(image_weight)
         if not str(text or "").strip():
+            if weight == 0:
+                raise ValueError("image_weight=0 requires nonempty text")
             self.last_encoding_audit = {"text_sha256": _text_digest(str(text or "")),
                                         "input_tokens": 0, "encoded_tokens": 0,
                                         "chunks": 0, "truncated": False}
+            return self.encode(path)
+        if weight == 0:
+            return self.encode_text(text)
+        image = self.encode(path)
+        if weight == 1:
+            self.last_encoding_audit = {
+                "text_sha256": _text_digest(str(text)), "text_skipped": True,
+                "reason": "image_weight_is_one", "encoded_tokens": 0,
+                "chunks": 0, "truncated": False,
+            }
             return image
-        return normalized(image + self.encode_text(text))
+        text_vector = self.encode_text(text)
+        # Multiplying both operands by .5 is mathematically equivalent but can
+        # alter float32 rounding. Keep the old arithmetic bit-for-bit at .5.
+        if weight == 0.5:
+            return normalized(image + text_vector)
+        return normalized(weight * image + (1 - weight) * text_vector)
 
     def close(self):
         if self.closed:
@@ -153,6 +190,8 @@ class ChunkedClipEncoder:
 
 class GMEProcessEncoder:
     """One persistent worker; no installs, downloads, or silent model fallback."""
+
+    supports_image_weight = False
 
     def __init__(self, python=None, model=None, device="cuda", timeout=300,
                  root=DEFAULT_DUAL_ROOT, worker=None):
@@ -221,7 +260,9 @@ class GMEProcessEncoder:
         response = self._request({"op": "image", "path": str(Path(path).resolve())})
         return normalized(response["vector"])
 
-    def encode_joint(self, text, path):
+    def encode_joint(self, text, path, image_weight=0.5):
+        if validated_image_weight(image_weight) != 0.5:
+            raise ValueError("GME native joint fusion does not support manual image_weight; use 0.5")
         response = self._request({"op": "joint", "text": str(text or ""),
                                   "path": str(Path(path).resolve())})
         self.last_encoding_audit = response.get("audit")

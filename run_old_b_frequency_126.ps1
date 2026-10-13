@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Prepare','Run','Evaluate','Resume','Check','Status')]
+    [ValidateSet('Prepare','Optimize','Run','Evaluate','Resume','Check','Status')]
     [string]$Stage = 'Run',
     [ValidateRange(1,65535)][int]$Port = 3007,
     [ValidateSet('frequency_momentum','ssa')][string]$Method = 'frequency_momentum',
@@ -12,7 +12,12 @@ param(
     [Nullable[int]]$SsaSamples,
     [Nullable[double]]$SsaRho,
     [Nullable[double]]$SsaSigma,
-    [Nullable[double]]$SsaMomentum
+    [Nullable[double]]$SsaMomentum,
+    [string]$SsaOptions,
+    [ValidateSet('full','instruction','semantic')][string]$IndexText = 'full',
+    [ValidateRange(0,1)][double]$KeyImageWeight = 0.5,
+    [ValidateRange(0,1)][double]$QueryImageWeight = 0.5,
+    [ValidateSet('all','adversarial','clean','no_memory')][string]$Condition
 )
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -29,6 +34,9 @@ try {
         '--device', $Device)
     if ($Root) { $pipelineArguments += @('--root', $Root) }
     if ($SourceRoot) { $pipelineArguments += @('--source-root', $SourceRoot) }
+    if ($SsaOptions) { $pipelineArguments += @('--ssa-options', $SsaOptions) }
+    if ($Condition) { $pipelineArguments += @('--condition', $Condition) }
+    $pipelineArguments += @('--index-text', $IndexText, '--key-image-weight', "$KeyImageWeight", '--query-image-weight', "$QueryImageWeight")
     foreach ($parameter in @(
         @('FrequencyAxisRatio', '--frequency-axis-ratio', $FrequencyAxisRatio),
         @('FrequencyMomentum', '--frequency-momentum', $FrequencyMomentum),

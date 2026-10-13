@@ -6,6 +6,40 @@ import uuid
 
 import numpy as np
 
+from src.vision.joint_encoder import ChunkedClipEncoder, GMEProcessEncoder, validated_image_weight
+
+
+RETRIEVAL_CACHE_SCHEMA = 3
+
+
+def pillow_decoder_signature():
+    """Read local decoder build information, without opening an image.
+
+    Imported only for encoders known to decode in this process. A retriever
+    captures this once; ranking every image does not repeat decoder inspection.
+    """
+    import PIL
+    from PIL import features
+
+    turbo = features.check_feature("libjpeg_turbo")
+    return {"schema_version": 1, "scope": "local_encoder_process", "library": "Pillow",
+            "verified": True, "pillow_version": PIL.__version__,
+            "jpeg_version": features.version_codec("jpg"),
+            "libjpeg_turbo_enabled": turbo,
+            "libjpeg_turbo_version": features.version_feature("libjpeg_turbo") if turbo else None}
+
+
+def encoder_image_decoder_signature(encoder):
+    """Do not attribute the parent Pillow build to a separate GME interpreter."""
+    provider = encoder.snapshot.get("provider")
+    if isinstance(encoder, GMEProcessEncoder) or provider == "gme":
+        return {"schema_version": 1, "scope": "encoder_worker_process", "verified": False,
+                "reason": "worker_image_decoder_runtime_not_reported"}
+    if isinstance(encoder, ChunkedClipEncoder) or provider == "clip":
+        return pillow_decoder_signature()
+    return {"schema_version": 1, "scope": "encoder_managed_or_unknown", "verified": False,
+            "reason": "image_decoder_runtime_not_reported"}
+
 
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -25,6 +59,24 @@ INDEX_TEXT_POLICY = {
     "excluded": "audit_labels_source_role_attack_metadata_reward_policy_trace_task_goal",
 }
 
+SEMANTIC_INDEX_TEXT_POLICY = {
+    "version": 1,
+    "fields": ["Instruction", "PrimaryImage.Title", "FinalOptions"],
+    "coverage": "observed_instruction_purchased_title_and_final_options",
+    "purchase_binding": "primary_asin_must_match_final_asin",
+    "excluded": ["Actions", "FinalASIN", "FinalPrice", "audit_labels_source_role_attack_metadata"],
+}
+
+
+def index_text_policy(mode):
+    if mode == "full":
+        return INDEX_TEXT_POLICY
+    if mode == "instruction":
+        return {"version": 1, "fields": ["Instruction"]}
+    if mode == "semantic":
+        return SEMANTIC_INDEX_TEXT_POLICY
+    raise ValueError("index_text must be full, instruction or semantic")
+
 
 def canonical_digest(value):
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -36,8 +88,24 @@ def memory_index_text(entry, mode="full"):
     """Use observed history only, excluding experiment labels and scoring goals."""
     if mode == "instruction":
         return str(entry.get("Instruction", ""))
+    if mode == "semantic":
+        primary = entry.get("PrimaryImage") or {}
+        if not isinstance(primary, dict):
+            raise ValueError("semantic index requires an observed PrimaryImage record")
+        title = str(primary.get("Title") or "").strip()
+        primary_asin = str(primary.get("ASIN") or "").strip()
+        final_asin = str(entry.get("FinalASIN") or "").strip()
+        if not title or not primary_asin or not final_asin:
+            raise ValueError("semantic index requires a purchased Title, PrimaryImage.ASIN and FinalASIN")
+        if primary_asin != final_asin:
+            raise ValueError("semantic index purchased title ASIN does not match FinalASIN")
+        purchase = {"Title": title}
+        if entry.get("FinalOptions") is not None:
+            purchase["FinalOptions"] = entry["FinalOptions"]
+        return "Instruction:\n" + str(entry.get("Instruction", "")) + "\n\nObserved purchase:\n" + json.dumps(
+            purchase, ensure_ascii=False, sort_keys=True)
     if mode != "full":
-        raise ValueError("index_text must be full or instruction")
+        raise ValueError("index_text must be full, instruction or semantic")
     sections = ["Instruction:\n" + str(entry.get("Instruction", ""))]
     actions = entry.get("Actions", [])
     if isinstance(actions, (list, tuple)):
@@ -75,35 +143,52 @@ def resolve_image(entry, memory_path):
 
 class VisualMemoryRetriever:
     def __init__(self, encoder, memory_path, key_mode="image", query_mode="image",
-                 index_text="full", cache_dir="auto"):
+                 index_text="full", cache_dir="auto", key_image_weight=0.5,
+                 query_image_weight=0.5):
         if key_mode not in {"image", "joint"} or query_mode not in {"image", "joint"}:
             raise ValueError("key/query mode must be image or joint")
         self.encoder = encoder
         self.memory_path = Path(memory_path).resolve()
         self.key_mode, self.query_mode = key_mode, query_mode
-        if index_text not in {"full", "instruction"}:
-            raise ValueError("index_text must be full or instruction")
+        policy = index_text_policy(index_text)
         self.index_text = index_text
+        self.key_image_weight = validated_image_weight(key_image_weight)
+        self.query_image_weight = validated_image_weight(query_image_weight)
+        # Default calls remain compatible with encoders exposing only the old
+        # two positional arguments. A requested unsupported fusion must fail.
+        if getattr(encoder, "supports_image_weight", None) is False and (
+                self.key_image_weight != 0.5 or self.query_image_weight != 0.5):
+            raise ValueError("Selected encoder uses native joint fusion and does not support manual image weights")
         self.cache_dir = (self.memory_path.parent / "retrieval_index_cache"
                           if cache_dir == "auto" else Path(cache_dir).resolve()
                           if cache_dir is not None else None)
         self.cache = {}
         self.audits = {}
+        self.image_decoder = encoder_image_decoder_signature(encoder)
         self.snapshot = {"encoder": encoder.snapshot, "key_mode": key_mode,
                          "query_mode": query_mode, "index_text": index_text,
-                         "index_text_policy": INDEX_TEXT_POLICY if index_text == "full"
-                         else {"version": 1, "fields": ["Instruction"]},
-                         "cache_schema": 1}
+                         "index_text_policy": policy,
+                         "key_image_weight": self.key_image_weight,
+                         "query_image_weight": self.query_image_weight,
+                         "image_decoder": self.image_decoder,
+                         "cache_schema": RETRIEVAL_CACHE_SCHEMA}
 
-    def _encode(self, text, path, mode, *, scope="query"):
+    def _encode(self, text, path, mode, *, scope="query", image_weight=0.5):
+        weight = validated_image_weight(image_weight)
         digest = sha256(path)
         key = canonical_digest({"mode": mode, "image_sha256": digest,
                                 "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
                                 if mode == "joint" else None,
                                 "model_sha256": canonical_digest(self.encoder.snapshot),
-                                "scope": scope})
+                                "image_decoder_sha256": canonical_digest(self.image_decoder),
+                                "scope": scope, "image_weight": weight if mode == "joint" else None,
+                                "cache_schema": RETRIEVAL_CACHE_SCHEMA})
         if key not in self.cache:
-            value = self.encoder.encode_joint(text, path) if mode == "joint" else self.encoder.encode(path)
+            if mode == "joint":
+                value = (self.encoder.encode_joint(text, path) if weight == 0.5
+                         else self.encoder.encode_joint(text, path, image_weight=weight))
+            else:
+                value = self.encoder.encode(path)
             self.cache[key] = unit(value)
             audit = getattr(self.encoder, "last_encoding_audit", None) if mode == "joint" else None
             self.audits[key] = json.loads(json.dumps(audit)) if audit is not None else None
@@ -135,7 +220,7 @@ class VisualMemoryRetriever:
             vector = self.cache[key].tolist()
             vectors[key] = {"vector": vector, "vector_sha256": canonical_digest(vector),
                             "encoding_audit": self.audits.get(key)}
-        payload = {"schema_version": 1, "identity": identity, "vectors": vectors}
+        payload = {"schema_version": RETRIEVAL_CACHE_SCHEMA, "identity": identity, "vectors": vectors}
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
@@ -145,15 +230,24 @@ class VisualMemoryRetriever:
             if temporary.is_file():
                 temporary.unlink()
 
+    def index_identity(self, memory):
+        """The same index identity is used by ranking and offline preparation."""
+        return {"bank_sha256": sha256(self.memory_path) if self.memory_path.is_file() else None,
+                "entries_sha256": canonical_digest(memory),
+                "model_sha256": canonical_digest(self.encoder.snapshot),
+                "key_mode": self.key_mode, "query_mode": self.query_mode,
+                "index_text": self.index_text,
+                "index_text_policy_sha256": canonical_digest(self.snapshot["index_text_policy"]),
+                "key_image_weight": self.key_image_weight,
+                "query_image_weight": self.query_image_weight,
+                "image_decoder_sha256": canonical_digest(self.image_decoder),
+                "cache_schema": RETRIEVAL_CACHE_SCHEMA}
+
     def rank(self, memory, instruction, query_image):
         # Bank bytes, caller entries and encoder configuration are refreshed on
         # every ranking, even if this retriever instance is reused after edits.
-        bank_sha = sha256(self.memory_path) if self.memory_path.is_file() else None
-        model_sha = canonical_digest(self.encoder.snapshot)
-        identity = {"bank_sha256": bank_sha, "entries_sha256": canonical_digest(memory),
-                    "model_sha256": model_sha, "key_mode": self.key_mode,
-                    "index_text": self.index_text,
-                    "index_text_policy_sha256": canonical_digest(self.snapshot["index_text_policy"])}
+        identity = self.index_identity(memory)
+        bank_sha, model_sha = identity["bank_sha256"], identity["model_sha256"]
         scope = canonical_digest(identity)
         cache_path = self.cache_dir / (scope + ".json") if self.cache_dir else None
         self._load_index_cache(cache_path, identity)
@@ -161,7 +255,8 @@ class VisualMemoryRetriever:
                              model_sha256=model_sha, entries_sha256=identity["entries_sha256"])
         query_text = str(instruction or "")
         query_path = Path(query_image).resolve()
-        query, query_key = self._encode(query_text, query_path, self.query_mode)
+        query, query_key = self._encode(query_text, query_path, self.query_mode,
+                                        image_weight=self.query_image_weight)
         query_audit = self.audits.get(query_key)
         self.snapshot["query_encoding_audit"] = query_audit
         ranked = []
@@ -171,7 +266,8 @@ class VisualMemoryRetriever:
             if path is None:
                 continue
             text = memory_index_text(entry, self.index_text) if self.key_mode == "joint" else ""
-            vector, key = self._encode(text, path, self.key_mode, scope=scope)
+            vector, key = self._encode(text, path, self.key_mode, scope=scope,
+                                      image_weight=self.key_image_weight)
             keys.append(key)
             if vector.shape != query.shape:
                 raise ValueError("Query and memory vector dimensions differ")
@@ -179,6 +275,9 @@ class VisualMemoryRetriever:
                            "image_sha256": sha256(path),
                            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                            "text_characters": len(text), "index_text": self.index_text,
+                           "key_image_weight": self.key_image_weight,
+                           "query_image_weight": self.query_image_weight,
+                           "image_decoder_sha256": canonical_digest(self.image_decoder),
                            "model_sha256": model_sha, "bank_sha256": bank_sha,
                            "query_text_sha256": hashlib.sha256(query_text.encode("utf-8")).hexdigest(),
                            "query_image_sha256": sha256(query_path),
